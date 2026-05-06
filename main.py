@@ -16,5 +16,5 @@ def set_seeds(seed: int = 42):
 
 if __name__ == "__main__":
     set_seeds(42)
-    print(f"Running LISR on Breakout | device={cfg.DEVICE}")
+    print(f"Running LISR on HalfCheetah-v4 | device={cfg.DEVICE}")
     run_lisr(log_dir="./lisr_logs")

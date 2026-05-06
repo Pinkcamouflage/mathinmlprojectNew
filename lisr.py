@@ -1,18 +1,31 @@
 """
 LISR — Learning Intrinsic Symbolic Rewards in Reinforcement Learning
-Algorithm 1 implementation for Breakout (discrete actions).
+Algorithm 1 implementation for HalfCheetah-v4 (continuous control).
+
+Parallelism strategy
+--------------------
+- Each actor / learner owns an envpool env with NUM_ENVS_PER_ACTOR parallel instances.
+- All actor evaluations within a phase run concurrently via ThreadPoolExecutor.
+  * C++ env-stepping inside each thread is already parallel (envpool's thread pool).
+  * GPU forward passes issued from each thread are queued by the CUDA driver and
+    overlapped with the C++ env-stepping of the other threads.
+- Replay-buffer writes are batched per actor (one lock acquisition per evaluation)
+  to keep synchronisation overhead negligible.
 """
 
-import random
 import os
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
 import torch
 
 import config as cfg
-from replay_buffer import ReplayBuffer
-from symbolic_tree import generate_random_tree, crossover as tree_crossover, mutate as tree_mutate
 from ea_actor import EAActor, crossover as actor_crossover, mutate as actor_mutate, tournament_select
+from environment import make_envpool_env, evaluate_policy_vectorized
 from learner import SRLearner
-from environment import make_env, evaluate_policy
+from replay_buffer import ReplayBuffer
+from symbolic_tree import crossover as tree_crossover, generate_random_tree, mutate as tree_mutate
 
 
 # ---------------------------------------------------------------------------
@@ -20,22 +33,75 @@ from environment import make_env, evaluate_policy
 # ---------------------------------------------------------------------------
 
 def init_portfolio(num_learners: int) -> list:
-    """Create m SR learners, each with a randomly generated symbolic tree."""
     return [
-        SRLearner(generate_random_tree(cfg.MAX_TREE_DEPTH), cfg.NUM_ACTIONS, cfg)
+        SRLearner(generate_random_tree(cfg.MAX_TREE_DEPTH), cfg)
         for _ in range(num_learners)
     ]
 
 
 # ---------------------------------------------------------------------------
-# Helper: tournament selection on symbolic trees
+# Policy function factories — return numpy arrays for envpool compatibility
 # ---------------------------------------------------------------------------
 
-def _tree_tournament(portfolio: list, fitness: list, k: int = 3):
-    """Return the symbolic tree of the tournament winner (no clone — caller clones)."""
+def _ea_policy(actor: EAActor):
+    def fn(obs_tensor: torch.Tensor) -> np.ndarray:
+        return actor.act(obs_tensor)        # np.ndarray (N, ACTION_DIM)
+    return fn
+
+
+def _learner_policy(learner: SRLearner):
+    def fn(obs_tensor: torch.Tensor) -> np.ndarray:
+        return learner.act(obs_tensor, deterministic=False)   # np.ndarray (N, ACTION_DIM)
+    return fn
+
+
+# ---------------------------------------------------------------------------
+# Concurrent evaluation helpers
+# ---------------------------------------------------------------------------
+
+def _eval_concurrent(policy_fns, envs, replay_buffer, eval_steps, device, label):
+    """Evaluate all actors concurrently, return list of fitness values."""
+    fitness = [None] * len(policy_fns)
+
+    def _task(idx):
+        return idx, evaluate_policy_vectorized(
+            policy_fns[idx], envs[idx], eval_steps, replay_buffer, device
+        )
+
+    with ThreadPoolExecutor(max_workers=len(policy_fns)) as pool:
+        futures = {pool.submit(_task, i): i for i in range(len(policy_fns))}
+        for fut in as_completed(futures):
+            idx, fit = fut.result()
+            fitness[idx] = fit
+
+    print(f"  {label} fitness: {[f'{f:.1f}' for f in fitness]}")
+    return fitness
+
+
+# ---------------------------------------------------------------------------
+# Symbolic-tree tournament selection
+# ---------------------------------------------------------------------------
+
+def _tree_tournament(portfolio, fitness, k=3):
     candidates = random.sample(range(len(portfolio)), min(k, len(portfolio)))
     winner = max(candidates, key=lambda i: fitness[i])
     return portfolio[winner].symbolic_tree
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+def _save_checkpoint(learner: SRLearner, gen: int, log_dir: str):
+    path = os.path.join(log_dir, f"best_learner_gen{gen}.pt")
+    torch.save({
+        "q1":           learner.q1.state_dict(),
+        "q2":           learner.q2.state_dict(),
+        "actor":        learner.actor.state_dict(),
+        "log_alpha":    learner.log_alpha.item(),
+        "symbolic_tree": repr(learner.symbolic_tree),
+    }, path)
+    print(f"  Checkpoint saved → {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -46,24 +112,25 @@ def run_lisr(log_dir: str = "./lisr_logs"):
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "training.csv")
 
-    print(f"Device: {cfg.DEVICE}")
+    print(f"Device            : {cfg.DEVICE}")
     print(f"EA pop={cfg.EA_POP_SIZE}, elites={cfg.EA_ELITE_SIZE}")
     print(f"Portfolio size={cfg.PORTFOLIO_SIZE}, elites={cfg.PORTFOLIO_ELITE_SIZE}")
+    print(f"Envs per actor    : {cfg.NUM_ENVS_PER_ACTOR}")
+    print(f"Eval steps        : {cfg.EVAL_STEPS}  "
+          f"(= {cfg.EVAL_STEPS * cfg.NUM_ENVS_PER_ACTOR} env interactions per actor)")
 
     # --- Initialise components (lines 1-3) ---
-    portfolio = init_portfolio(cfg.PORTFOLIO_SIZE)
-    ea_pop = [EAActor(cfg.NUM_ACTIONS, cfg.DEVICE) for _ in range(cfg.EA_POP_SIZE)]
-    replay_buffer = ReplayBuffer(cfg.BUFFER_SIZE, obs_shape=(4, 84, 84), device=cfg.DEVICE)
+    portfolio     = init_portfolio(cfg.PORTFOLIO_SIZE)
+    ea_pop        = [EAActor(cfg.DEVICE) for _ in range(cfg.EA_POP_SIZE)]
+    replay_buffer = ReplayBuffer(cfg.BUFFER_SIZE, obs_dim=cfg.OBS_DIM, action_dim=cfg.ACTION_DIM)
 
-    # Separate environments for each actor / learner to allow independent resets
-    ea_envs = [make_env(seed=i) for i in range(cfg.EA_POP_SIZE)]
-    learner_envs = [make_env(seed=100 + i) for i in range(cfg.PORTFOLIO_SIZE)]
+    ea_envs      = [make_envpool_env(cfg.NUM_ENVS_PER_ACTOR, seed=i)       for i in range(cfg.EA_POP_SIZE)]
+    learner_envs = [make_envpool_env(cfg.NUM_ENVS_PER_ACTOR, seed=100 + i) for i in range(cfg.PORTFOLIO_SIZE)]
 
     with open(log_path, "w") as f:
         f.write("generation,best_ea_fitness,best_learner_fitness,buffer_size\n")
 
     best_learner_fitness = -float("inf")
-    best_learner: SRLearner = None
 
     # -----------------------------------------------------------------------
     # Generation loop (line 5)
@@ -73,31 +140,32 @@ def run_lisr(log_dir: str = "./lisr_logs"):
         print(f"Generation {gen}/{cfg.NUM_GENERATIONS}  |  buffer={len(replay_buffer)}")
 
         # -------------------------------------------------------------------
-        # EA actor evaluation (lines 6-7)
+        # EA actor evaluation — concurrent (lines 6-7)
         # -------------------------------------------------------------------
-        ea_fitness = []
-        for i, actor in enumerate(ea_pop):
-            policy_fn = _make_ea_policy(actor)
-            fit = evaluate_policy(policy_fn, ea_envs[i], cfg.EVAL_STEPS, replay_buffer, cfg.DEVICE)
-            ea_fitness.append(fit)
-        print(f"  EA fitness:  {[f'{f:.1f}' for f in ea_fitness]}")
+        ea_fitness = _eval_concurrent(
+            [_ea_policy(a) for a in ea_pop],
+            ea_envs, replay_buffer, cfg.EVAL_STEPS, cfg.DEVICE,
+            label="EA",
+        )
 
         # -------------------------------------------------------------------
-        # Rank EA actors (line 8) and evolve (lines 9-15)
+        # EA evolution (lines 8-15)
         # -------------------------------------------------------------------
         ranked = sorted(range(cfg.EA_POP_SIZE), key=lambda i: ea_fitness[i], reverse=True)
-
         elites = [ea_pop[i].clone() for i in ranked[: cfg.EA_ELITE_SIZE]]
 
-        # Tournament-select parents, apply crossover with elites, then mutate
         offspring = []
-        needed = cfg.EA_POP_SIZE - cfg.EA_ELITE_SIZE
-        while len(offspring) < needed:
+        while len(offspring) < cfg.EA_POP_SIZE - cfg.EA_ELITE_SIZE:
             parent = tournament_select(ea_pop, ea_fitness, cfg.TOURNAMENT_SIZE)
-            elite = random.choice(elites)
-            child = actor_crossover(elite, parent)          # single-point crossover (line 12)
-            if random.random() < cfg.MUT_PROB:             # mutation (lines 13-15)
-                child = actor_mutate(child, cfg.MUT_NOISE_STD)
+            child  = actor_crossover(random.choice(elites), parent)   # line 12
+            if random.random() < cfg.MUT_PROB:                        # lines 13-15
+                child = actor_mutate(
+                    child,
+                    mutfrac=cfg.MUT_FRAC,
+                    mutstrength=cfg.MUT_STRENGTH,
+                    supermutprob=cfg.SUPER_MUT_PROB,
+                    resetmutprob=cfg.RESET_MUT_PROB,
+                )
             offspring.append(child)
 
         ea_pop = elites + offspring
@@ -105,56 +173,51 @@ def run_lisr(log_dir: str = "./lisr_logs"):
         # -------------------------------------------------------------------
         # Learner gradient updates (lines 16-24)
         # -------------------------------------------------------------------
-        if len(replay_buffer) >= cfg.BATCH_SIZE:
-            total_losses = {"q1_loss": 0.0, "q2_loss": 0.0, "pi_loss": 0.0}
+        if len(replay_buffer) >= max(cfg.BATCH_SIZE, cfg.EXPLORATION_STEPS):
+            total_losses = {"q1_loss": 0.0, "q2_loss": 0.0, "actor_loss": 0.0, "alpha": 0.0}
             for learner in portfolio:
                 for _ in range(cfg.GRAD_STEPS_PER_GEN):
                     batch = replay_buffer.sample(cfg.BATCH_SIZE)
-                    losses = learner.update(batch)
-                    for k, v in losses.items():
+                    for k, v in learner.update(batch).items():
                         total_losses[k] += v
             n = cfg.PORTFOLIO_SIZE * cfg.GRAD_STEPS_PER_GEN
-            print(f"  Learner losses — q1={total_losses['q1_loss']/n:.4f}  "
-                  f"q2={total_losses['q2_loss']/n:.4f}  pi={total_losses['pi_loss']/n:.4f}")
+            print(f"  Losses — q1={total_losses['q1_loss']/n:.4f}  "
+                  f"q2={total_losses['q2_loss']/n:.4f}  "
+                  f"actor={total_losses['actor_loss']/n:.4f}  "
+                  f"α={total_losses['alpha']/n:.4f}")
 
         # -------------------------------------------------------------------
-        # Learner evaluation (lines 25-26)
+        # Learner evaluation — concurrent (lines 25-26)
         # -------------------------------------------------------------------
-        learner_fitness = []
-        for i, learner in enumerate(portfolio):
-            policy_fn = _make_learner_policy(learner)
-            fit = evaluate_policy(policy_fn, learner_envs[i], cfg.EVAL_STEPS, replay_buffer, cfg.DEVICE)
-            learner_fitness.append(fit)
-        print(f"  Learner fitness: {[f'{f:.1f}' for f in learner_fitness]}")
+        learner_fitness = _eval_concurrent(
+            [_learner_policy(l) for l in portfolio],
+            learner_envs, replay_buffer, cfg.EVAL_STEPS, cfg.DEVICE,
+            label="Learner",
+        )
 
-        # Track best learner for checkpointing
+        # Checkpoint best learner
         best_idx = max(range(cfg.PORTFOLIO_SIZE), key=lambda i: learner_fitness[i])
         if learner_fitness[best_idx] > best_learner_fitness:
             best_learner_fitness = learner_fitness[best_idx]
-            best_learner = portfolio[best_idx]
-            _save_checkpoint(best_learner, gen, log_dir)
-            print(f"  *** New best learner fitness: {best_learner_fitness:.1f} (gen {gen}) ***")
+            _save_checkpoint(portfolio[best_idx], gen, log_dir)
 
         # -------------------------------------------------------------------
         # Rank learners and evolve symbolic trees (lines 27-32)
         # -------------------------------------------------------------------
-        ranked_l = sorted(range(cfg.PORTFOLIO_SIZE), key=lambda i: learner_fitness[i], reverse=True)
-
+        ranked_l       = sorted(range(cfg.PORTFOLIO_SIZE), key=lambda i: learner_fitness[i], reverse=True)
         elite_learners = [portfolio[i] for i in ranked_l[: cfg.PORTFOLIO_ELITE_SIZE]]
 
-        # Build (m - j) evolved trees via tournament selection + crossover + mutation
         new_trees = []
-        needed_trees = cfg.PORTFOLIO_SIZE - cfg.PORTFOLIO_ELITE_SIZE
-        while len(new_trees) < needed_trees:
+        while len(new_trees) < cfg.PORTFOLIO_SIZE - cfg.PORTFOLIO_ELITE_SIZE:
             parent_tree = _tree_tournament(portfolio, learner_fitness).clone()
-            elite_tree = random.choice(elite_learners).symbolic_tree
-            child_tree, _ = tree_crossover(elite_tree.clone(), parent_tree)  # crossover (line 31)
-            child_tree = tree_mutate(child_tree, cfg.MAX_TREE_DEPTH)         # mutation  (line 32)
+            elite_tree  = random.choice(elite_learners).symbolic_tree
+            child_tree, _ = tree_crossover(elite_tree.clone(), parent_tree)  # line 31
+            child_tree     = tree_mutate(child_tree, cfg.MAX_TREE_DEPTH)     # line 32
             new_trees.append(child_tree)
 
-        # Assign new trees to non-elite learner slots (neural networks are kept)
+        # Rebuild portfolio: keep elite learners, assign evolved trees to non-elite slots
         new_portfolio = list(elite_learners)
-        for i, (idx, tree) in enumerate(zip(ranked_l[cfg.PORTFOLIO_ELITE_SIZE:], new_trees)):
+        for idx, tree in zip(ranked_l[cfg.PORTFOLIO_ELITE_SIZE:], new_trees):
             portfolio[idx].symbolic_tree = tree
             new_portfolio.append(portfolio[idx])
         portfolio = new_portfolio
@@ -163,7 +226,9 @@ def run_lisr(log_dir: str = "./lisr_logs"):
         # Logging
         # -------------------------------------------------------------------
         best_ea = max(ea_fitness)
-        best_l = max(learner_fitness)
+        best_l  = max(learner_fitness)
+        print(f"  Best EA={best_ea:.1f}  Best Learner={best_l:.1f}  "
+              f"Overall best={best_learner_fitness:.1f}")
         with open(log_path, "a") as f:
             f.write(f"{gen},{best_ea:.2f},{best_l:.2f},{len(replay_buffer)}\n")
 
@@ -174,34 +239,3 @@ def run_lisr(log_dir: str = "./lisr_logs"):
     print("\nTraining complete.")
     print(f"Best learner extrinsic fitness: {best_learner_fitness:.2f}")
     return portfolio, ea_pop
-
-
-# ---------------------------------------------------------------------------
-# Policy function factories (avoid closure-capture issues in loops)
-# ---------------------------------------------------------------------------
-
-def _make_ea_policy(actor: EAActor):
-    def policy_fn(obs_tensor):
-        return actor.act(obs_tensor)
-    return policy_fn
-
-
-def _make_learner_policy(learner: SRLearner):
-    @torch.no_grad()
-    def policy_fn(obs_tensor):
-        return int(learner.policy.act(obs_tensor, deterministic=False).item())
-    return policy_fn
-
-
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
-
-def _save_checkpoint(learner: SRLearner, gen: int, log_dir: str):
-    path = os.path.join(log_dir, f"best_learner_gen{gen}.pt")
-    torch.save({
-        "policy": learner.policy.state_dict(),
-        "q1": learner.q1.state_dict(),
-        "q2": learner.q2.state_dict(),
-        "symbolic_tree": repr(learner.symbolic_tree),
-    }, path)

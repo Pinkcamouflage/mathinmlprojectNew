@@ -1,43 +1,53 @@
+import threading
 import numpy as np
-import torch
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, obs_shape, device):
-        self.capacity = capacity
-        self.device = device
-        self.pos = 0
+    """
+    Circular replay buffer for continuous-action environments.
+
+    Stores (obs, action, next_obs, done) as float32 vectors.
+    Reward is not stored — it is computed symbolically at sample time.
+
+    Observations are small vectors (e.g. 17 floats for HalfCheetah), so
+    next_obs is stored explicitly rather than recovered via a stride trick.
+    """
+
+    def __init__(self, capacity: int, obs_dim: int, action_dim: int):
+        self.capacity   = capacity
+        self.obs_dim    = obs_dim
+        self.action_dim = action_dim
+        self.pos  = 0
         self.size = 0
+        self._lock = threading.Lock()
 
-        # Store as uint8 to save memory; normalize to float on sampling
-        self.obs = np.zeros((capacity, *obs_shape), dtype=np.uint8)
-        self.next_obs = np.zeros((capacity, *obs_shape), dtype=np.uint8)
-        self.actions = np.zeros(capacity, dtype=np.int64)
-        self.done = np.zeros(capacity, dtype=np.float32)
+        self.obs      = np.zeros((capacity, obs_dim),    dtype=np.float32)
+        self.actions  = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, obs_dim),    dtype=np.float32)
+        self.done     = np.zeros(capacity,               dtype=np.float32)
 
-    def add(self, obs: np.ndarray, action: int, next_obs: np.ndarray, done: bool):
-        self.obs[self.pos] = obs
-        self.next_obs[self.pos] = next_obs
-        self.actions[self.pos] = action
-        self.done[self.pos] = float(done)
-
-        self.pos = (self.pos + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
+    def add_batch(self, obs_batch: np.ndarray, actions_batch: np.ndarray,
+                  next_obs_batch: np.ndarray, done_batch: np.ndarray):
+        """Thread-safe insert of N transitions in one lock acquisition."""
+        n = len(obs_batch)
+        with self._lock:
+            indices = np.arange(self.pos, self.pos + n) % self.capacity
+            self.obs[indices]      = obs_batch
+            self.actions[indices]  = actions_batch
+            self.next_obs[indices] = next_obs_batch
+            self.done[indices]     = done_batch.astype(np.float32)
+            self.pos  = int((self.pos + n) % self.capacity)
+            self.size = min(self.size + n, self.capacity)
 
     def sample(self, batch_size: int):
-        indices = np.random.randint(0, self.size, size=batch_size)
-
-        obs = torch.tensor(self.obs[indices], dtype=torch.float32, device=self.device) / 255.0
-        next_obs = torch.tensor(self.next_obs[indices], dtype=torch.float32, device=self.device) / 255.0
-        actions = torch.tensor(self.actions[indices], dtype=torch.long, device=self.device)
-        done = torch.tensor(self.done[indices], dtype=torch.float32, device=self.device)
-
-        # Also return CPU numpy copies for symbolic tree evaluation
-        obs_np = obs.cpu().numpy()
-        next_obs_np = next_obs.cpu().numpy()
-        actions_np = self.actions[indices].copy()
-
-        return obs, actions, next_obs, done, obs_np, actions_np, next_obs_np
+        """Returns float32 numpy arrays: (obs, actions, next_obs, done)."""
+        with self._lock:
+            indices  = np.random.randint(0, self.size, size=batch_size)
+            obs      = self.obs[indices].copy()
+            actions  = self.actions[indices].copy()
+            next_obs = self.next_obs[indices].copy()
+            done     = self.done[indices].copy()
+        return obs, actions, next_obs, done
 
     def __len__(self):
         return self.size

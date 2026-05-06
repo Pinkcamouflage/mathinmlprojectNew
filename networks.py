@@ -2,71 +2,81 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import config as cfg
 
-class AtariCNN(nn.Module):
+LOG_STD_MIN = -20
+LOG_STD_MAX = 2
+
+
+def _mlp(in_dim: int, hidden_size: int, out_dim: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden_size), nn.ReLU(),
+        nn.Linear(hidden_size, hidden_size), nn.ReLU(),
+        nn.Linear(hidden_size, out_dim),
+    )
+
+
+class GaussianPolicy(nn.Module):
     """
-    Standard Atari CNN feature extractor.
-    Input : (B, 4, 84, 84) float32
-    Output: (B, 3136)
+    SAC stochastic policy with tanh squashing.
+    forward() → (action, log_prob) using reparameterization.
+    act()     → deterministic (mean) or stochastic sample, no grad.
     """
-    def __init__(self):
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=8, stride=4),  # → (B, 32, 20, 20)
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),  # → (B, 64, 9, 9)
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),  # → (B, 64, 7, 7)
-            nn.ReLU(),
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size), nn.ReLU(),
         )
-        self.out_dim = 64 * 7 * 7  # 3136
+        self.mean_head    = nn.Linear(hidden_size, action_dim)
+        self.log_std_head = nn.Linear(hidden_size, action_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).flatten(start_dim=1)
+    def forward(self, obs: torch.Tensor):
+        """Returns (action (B,A), log_prob (B,)) via reparameterization."""
+        h = self.trunk(obs)
+        mean    = self.mean_head(h)
+        log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        std     = log_std.exp()
 
+        dist  = torch.distributions.Normal(mean, std)
+        x_t   = dist.rsample()
+        action = torch.tanh(x_t)
 
-class PolicyNetwork(nn.Module):
-    """
-    Discrete-action stochastic policy.
-    Returns a probability distribution over actions.
-    """
-    def __init__(self, num_actions: int):
-        super().__init__()
-        self.cnn = AtariCNN()
-        self.fc = nn.Sequential(
-            nn.Linear(self.cnn.out_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_actions),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns action probabilities (B, num_actions)."""
-        logits = self.fc(self.cnn(x))
-        return F.softmax(logits, dim=-1)
+        # log prob with tanh correction (numerically stable)
+        log_prob = dist.log_prob(x_t) - torch.log(1.0 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1)
+        return action, log_prob
 
     @torch.no_grad()
-    def act(self, x: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        """Returns scalar action indices (B,)."""
-        probs = self.forward(x)
+    def act(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        h    = self.trunk(obs)
+        mean = self.mean_head(h)
         if deterministic:
-            return probs.argmax(dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+            return torch.tanh(mean)
+        log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        x_t = torch.distributions.Normal(mean, log_std.exp()).sample()
+        return torch.tanh(x_t)
 
 
-class QNetwork(nn.Module):
-    """
-    Discrete-action Q-network.
-    Returns Q(s, a) for all actions simultaneously.
-    """
-    def __init__(self, num_actions: int):
+class DeterministicPolicy(nn.Module):
+    """EA actor: deterministic tanh-bounded policy."""
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int):
         super().__init__()
-        self.cnn = AtariCNN()
-        self.fc = nn.Sequential(
-            nn.Linear(self.cnn.out_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_actions),
-        )
+        self.net = _mlp(obs_dim, hidden_size, action_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns Q values (B, num_actions)."""
-        return self.fc(self.cnn(x))
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.net(obs))
+
+    @torch.no_grad()
+    def act(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.forward(obs)
+
+
+class MLPQNetwork(nn.Module):
+    """Q(s, a) → scalar. Input is concat(obs, action)."""
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int):
+        super().__init__()
+        self.net = _mlp(obs_dim + action_dim, hidden_size, 1)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([obs, action], dim=-1)).squeeze(-1)

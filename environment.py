@@ -1,49 +1,56 @@
 import numpy as np
 import torch
-import gymnasium as gym
-import ale_py
-from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
-
-gym.register_envs(ale_py)
+import envpool
 
 
-def make_env(seed: int = None) -> gym.Env:
-    """Create a frame-stacked, preprocessed Breakout environment."""
-    env = gym.make("ALE/Breakout-v5", frameskip=1)
-    env = AtariPreprocessing(env, scale_obs=False)
-    env = FrameStackObservation(env, stack_size=4)
-    if seed is not None:
-        env.reset(seed=seed)
-    return env
+def make_envpool_env(num_envs: int, seed: int = 0):
+    """Create a vectorised envpool HalfCheetah env."""
+    return envpool.make(
+        "HalfCheetah-v4",
+        env_type="gymnasium",
+        num_envs=num_envs,
+        seed=seed,
+    )
 
 
-def evaluate_policy(policy_fn, env: gym.Env, num_steps: int, replay_buffer, device: str) -> float:
+def evaluate_policy_vectorized(policy_fn, env, num_steps: int, replay_buffer, device: str) -> float:
     """
-    Roll out policy_fn in env for num_steps steps, storing transitions in replay_buffer.
+    Roll out policy_fn in a vectorised envpool env for num_steps steps.
 
-    policy_fn : callable (obs_tensor: Tensor (1,4,84,84)) → int action
-    Returns   : total extrinsic reward collected over num_steps steps.
+    policy_fn : callable (obs_tensor: Tensor (N, OBS_DIM) on device) → np.ndarray (N, ACTION_DIM)
+    num_steps : number of vectorised steps; total interactions = num_steps × num_envs
+    Returns   : per-env average extrinsic reward.
+
+    Transitions are batched locally and inserted in one replay-buffer write.
     """
-    obs, _ = env.reset()
+    obs, _ = env.reset()          # (N, OBS_DIM) float64
+    num_envs  = obs.shape[0]
+    obs_dim   = obs.shape[1]
+
+    all_obs      = np.empty((num_steps * num_envs, obs_dim), dtype=np.float32)
+    all_next_obs = np.empty((num_steps * num_envs, obs_dim), dtype=np.float32)
+    all_actions  = np.empty((num_steps * num_envs, 6),       dtype=np.float32)
+    all_done     = np.empty(num_steps * num_envs,             dtype=np.float32)
+
     total_reward = 0.0
 
-    for _ in range(num_steps):
-        obs_np = np.array(obs, dtype=np.uint8)           # (4, 84, 84) uint8
-        obs_f = obs_np.astype(np.float32) / 255.0
-        obs_tensor = torch.tensor(obs_f, dtype=torch.float32, device=device).unsqueeze(0)
+    for step in range(num_steps):
+        obs_tensor = torch.from_numpy(obs.astype(np.float32)).to(device)
 
-        action = policy_fn(obs_tensor)
+        with torch.no_grad():
+            actions = policy_fn(obs_tensor)     # np.ndarray (N, 6)
 
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
+        next_obs, reward, terminated, truncated, _ = env.step(actions)
+        done = np.logical_or(terminated, truncated).astype(np.float32)
 
-        next_obs_np = np.array(next_obs, dtype=np.uint8)
-        replay_buffer.add(obs_np, action, next_obs_np, done)
+        sl = slice(step * num_envs, (step + 1) * num_envs)
+        all_obs[sl]      = obs.astype(np.float32)
+        all_next_obs[sl] = next_obs.astype(np.float32)
+        all_actions[sl]  = actions.astype(np.float32)
+        all_done[sl]     = done
 
-        total_reward += float(reward)
+        total_reward += float(reward.sum())
         obs = next_obs
 
-        if done:
-            obs, _ = env.reset()
-
-    return total_reward
+    replay_buffer.add_batch(all_obs, all_actions, all_next_obs, all_done)
+    return total_reward / num_envs
