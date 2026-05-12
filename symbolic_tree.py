@@ -194,11 +194,19 @@ def crossover(tree1: SymbolicNode, tree2: SymbolicNode):
     return child1, child2
 
 
+def _cap_depth(node: SymbolicNode, max_depth: int, depth: int = 0) -> SymbolicNode:
+    """Replace any node at or beyond max_depth with a random terminal."""
+    if depth >= max_depth:
+        return _random_terminal()
+    node.children = [_cap_depth(c, max_depth, depth + 1) for c in node.children]
+    return node
+
+
 def mutate(tree: SymbolicNode, max_depth: int) -> SymbolicNode:
-    """Replace a random subtree with a freshly generated one."""
+    """Replace a random subtree with a freshly generated one, capped at max_depth."""
     mutant = tree.clone()
     nodes = mutant.all_nodes()
     target = random.choice(nodes)
     replacement = generate_random_tree(max_depth)
     _replace_node_in_place(target, replacement)
-    return mutant
+    return _cap_depth(mutant, max_depth)

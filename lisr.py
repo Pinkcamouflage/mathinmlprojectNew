@@ -22,7 +22,7 @@ import torch
 
 import config as cfg
 from ea_actor import EAActor, crossover as actor_crossover, mutate as actor_mutate, tournament_select
-from environment import make_envpool_env, evaluate_policy_vectorized
+from environment import make_envpool_env, evaluate_policy_vectorized, evaluate_policy_deterministic
 from learner import SRLearner
 from replay_buffer import ReplayBuffer
 from symbolic_tree import crossover as tree_crossover, generate_random_tree, mutate as tree_mutate
@@ -128,16 +128,23 @@ def run_lisr(log_dir: str = "./lisr_logs"):
     learner_envs = [make_envpool_env(cfg.NUM_ENVS_PER_ACTOR, seed=100 + i) for i in range(cfg.PORTFOLIO_SIZE)]
 
     with open(log_path, "w") as f:
-        f.write("generation,best_ea_fitness,best_learner_fitness,buffer_size\n")
+        f.write("generation,frames,mean_ea_fitness,best_ea_fitness,mean_learner_fitness,best_learner_fitness,eval_return,buffer_size\n")
+
+    frames_per_gen = (cfg.EA_POP_SIZE + cfg.PORTFOLIO_SIZE) * cfg.NUM_ENVS_PER_ACTOR * cfg.EVAL_STEPS
+    print(f"Frames per gen    : {frames_per_gen:,}  (target: {cfg.MAX_FRAMES:,})")
 
     best_learner_fitness = -float("inf")
+    total_frames = 0
+    gen = 0
 
     # -----------------------------------------------------------------------
     # Generation loop (line 5)
     # -----------------------------------------------------------------------
-    for gen in range(1, cfg.NUM_GENERATIONS + 1):
+    while total_frames < cfg.MAX_FRAMES:
+        gen += 1
+        total_frames += frames_per_gen
         print(f"\n{'='*60}")
-        print(f"Generation {gen}/{cfg.NUM_GENERATIONS}  |  buffer={len(replay_buffer)}")
+        print(f"Generation {gen}  |  frames={total_frames:,}/{cfg.MAX_FRAMES:,}  |  buffer={len(replay_buffer)}")
 
         # -------------------------------------------------------------------
         # EA actor evaluation — concurrent (lines 6-7)
@@ -225,12 +232,23 @@ def run_lisr(log_dir: str = "./lisr_logs"):
         # -------------------------------------------------------------------
         # Logging
         # -------------------------------------------------------------------
-        best_ea = max(ea_fitness)
-        best_l  = max(learner_fitness)
-        print(f"  Best EA={best_ea:.1f}  Best Learner={best_l:.1f}  "
-              f"Overall best={best_learner_fitness:.1f}")
+        best_ea  = max(ea_fitness)
+        mean_ea  = float(np.mean(ea_fitness))
+        best_l   = max(learner_fitness)
+        mean_l   = float(np.mean(learner_fitness))
+
+        # Deterministic eval of best learner — paper-comparable episodic return
+        best_learner = portfolio[max(range(cfg.PORTFOLIO_SIZE), key=lambda i: learner_fitness[i])]
+        eval_return  = evaluate_policy_deterministic(
+            _learner_policy(best_learner), num_episodes=5, device=cfg.DEVICE
+        )
+
+        print(f"  Best EA={best_ea:.1f}  Mean EA={mean_ea:.1f}  "
+              f"Best Learner={best_l:.1f}  Mean Learner={mean_l:.1f}  "
+              f"Eval return={eval_return:.1f}  Overall best={best_learner_fitness:.1f}")
         with open(log_path, "a") as f:
-            f.write(f"{gen},{best_ea:.2f},{best_l:.2f},{len(replay_buffer)}\n")
+            f.write(f"{gen},{total_frames},{mean_ea:.2f},{best_ea:.2f},"
+                    f"{mean_l:.2f},{best_l:.2f},{eval_return:.2f},{len(replay_buffer)}\n")
 
     # Cleanup
     for env in ea_envs + learner_envs:

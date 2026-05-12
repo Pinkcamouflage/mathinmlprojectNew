@@ -13,6 +13,31 @@ def make_envpool_env(num_envs: int, seed: int = 0):
     )
 
 
+def evaluate_policy_deterministic(policy_fn, num_episodes: int, device: str) -> float:
+    """
+    Evaluate a policy deterministically over complete episodes.
+    Creates a fresh single-env instance so episode boundaries are clean.
+    Returns mean episodic return — comparable to paper benchmark plots.
+    """
+    import envpool
+    env = envpool.make("HalfCheetah-v4", env_type="gymnasium", num_envs=1, seed=9999)
+    returns = []
+    for _ in range(num_episodes):
+        obs, _ = env.reset()
+        ep_return = 0.0
+        done = False
+        while not done:
+            obs_t = torch.from_numpy(obs.astype("float32")).to(device)
+            with torch.no_grad():
+                action = policy_fn(obs_t)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            ep_return += float(reward.sum())
+            done = bool(terminated[0] or truncated[0])
+        returns.append(ep_return)
+    env.close()
+    return float(np.mean(returns))
+
+
 def evaluate_policy_vectorized(policy_fn, env, num_steps: int, replay_buffer, device: str) -> float:
     """
     Roll out policy_fn in a vectorised envpool env for num_steps steps.

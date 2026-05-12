@@ -5,7 +5,7 @@ OBS_DIM = 17
 ACTION_DIM = 6
 
 # EA actor population
-EA_POP_SIZE = 50
+EA_POP_SIZE = 25
 EA_ELITE_SIZE = max(1, int(round(0.07 * EA_POP_SIZE)))  # e = 7% of k
 TOURNAMENT_SIZE = 3
 
@@ -17,9 +17,9 @@ SUPER_MUT_PROB = 0.05
 RESET_MUT_PROB = 0.05
 
 # Portfolio of SR learners
-PORTFOLIO_SIZE = 5
-PORTFOLIO_ELITE_SIZE = 1
-MAX_TREE_DEPTH = 3
+PORTFOLIO_SIZE = 25
+PORTFOLIO_ELITE_SIZE = max(1, int(round(0.07 * (PORTFOLIO_SIZE + EA_POP_SIZE))))
+MAX_TREE_DEPTH = 12
 
 # SAC hyperparameters (continuous control)
 GAMMA = 0.99
@@ -42,6 +42,6 @@ NUM_ENVS_PER_ACTOR = 8
 
 EVAL_STEPS = 250
 GRAD_STEPS_PER_GEN = 200
-NUM_GENERATIONS = 200
+MAX_FRAMES = 20_000_000
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
