@@ -22,7 +22,7 @@ import torch
 
 import config as cfg
 from ea_actor import EAActor, crossover as actor_crossover, mutate as actor_mutate, tournament_select
-from environment import make_envpool_env, evaluate_policy_vectorized, evaluate_policy_deterministic
+from environment import make_envpool_env, evaluate_policy, evaluate_policy_deterministic
 from learner import SRLearner
 from replay_buffer import ReplayBuffer
 from symbolic_tree import crossover as tree_crossover, generate_random_tree, mutate as tree_mutate
@@ -59,23 +59,23 @@ def _learner_policy(learner: SRLearner):
 # Concurrent evaluation helpers
 # ---------------------------------------------------------------------------
 
-def _eval_concurrent(policy_fns, envs, replay_buffer, eval_steps, device, label):
-    """Evaluate all actors concurrently, return list of fitness values."""
+def _eval_concurrent(policy_fns, envs, replay_buffer, device, label):
+    """Evaluate all actors concurrently. Returns (fitness list, total frames collected)."""
     fitness = [None] * len(policy_fns)
+    frames  = [0]    * len(policy_fns)
 
     def _task(idx):
-        return idx, evaluate_policy_vectorized(
-            policy_fns[idx], envs[idx], eval_steps, replay_buffer, device
-        )
+        return idx, *evaluate_policy(policy_fns[idx], envs[idx], replay_buffer, device)
 
     with ThreadPoolExecutor(max_workers=len(policy_fns)) as pool:
         futures = {pool.submit(_task, i): i for i in range(len(policy_fns))}
         for fut in as_completed(futures):
-            idx, fit = fut.result()
+            idx, fit, n = fut.result()
             fitness[idx] = fit
+            frames[idx]  = n
 
     print(f"  {label} fitness: {[f'{f:.1f}' for f in fitness]}")
-    return fitness
+    return fitness, sum(frames)
 
 
 # ---------------------------------------------------------------------------
@@ -115,23 +115,20 @@ def run_lisr(log_dir: str = "./lisr_logs"):
     print(f"Device            : {cfg.DEVICE}")
     print(f"EA pop={cfg.EA_POP_SIZE}, elites={cfg.EA_ELITE_SIZE}")
     print(f"Portfolio size={cfg.PORTFOLIO_SIZE}, elites={cfg.PORTFOLIO_ELITE_SIZE}")
-    print(f"Envs per actor    : {cfg.NUM_ENVS_PER_ACTOR}")
-    print(f"Eval steps        : {cfg.EVAL_STEPS}  "
-          f"(= {cfg.EVAL_STEPS * cfg.NUM_ENVS_PER_ACTOR} env interactions per actor)")
+    print(f"Eval mode         : single env, full episode (Algorithm 3)")
 
     # --- Initialise components (lines 1-3) ---
     portfolio     = init_portfolio(cfg.PORTFOLIO_SIZE)
     ea_pop        = [EAActor(cfg.DEVICE) for _ in range(cfg.EA_POP_SIZE)]
     replay_buffer = ReplayBuffer(cfg.BUFFER_SIZE, obs_dim=cfg.OBS_DIM, action_dim=cfg.ACTION_DIM)
 
-    ea_envs      = [make_envpool_env(cfg.NUM_ENVS_PER_ACTOR, seed=i)       for i in range(cfg.EA_POP_SIZE)]
-    learner_envs = [make_envpool_env(cfg.NUM_ENVS_PER_ACTOR, seed=100 + i) for i in range(cfg.PORTFOLIO_SIZE)]
+    ea_envs      = [make_envpool_env(seed=i)       for i in range(cfg.EA_POP_SIZE)]
+    learner_envs = [make_envpool_env(seed=100 + i) for i in range(cfg.PORTFOLIO_SIZE)]
 
     with open(log_path, "w") as f:
         f.write("generation,frames,mean_ea_fitness,best_ea_fitness,mean_learner_fitness,best_learner_fitness,eval_return,buffer_size\n")
 
-    frames_per_gen = (cfg.EA_POP_SIZE + cfg.PORTFOLIO_SIZE) * cfg.NUM_ENVS_PER_ACTOR * cfg.EVAL_STEPS
-    print(f"Frames per gen    : {frames_per_gen:,}  (target: {cfg.MAX_FRAMES:,})")
+    print(f"Frame budget      : {cfg.MAX_FRAMES:,}")
 
     best_learner_fitness = -float("inf")
     total_frames = 0
@@ -142,18 +139,18 @@ def run_lisr(log_dir: str = "./lisr_logs"):
     # -----------------------------------------------------------------------
     while total_frames < cfg.MAX_FRAMES:
         gen += 1
-        total_frames += frames_per_gen
         print(f"\n{'='*60}")
         print(f"Generation {gen}  |  frames={total_frames:,}/{cfg.MAX_FRAMES:,}  |  buffer={len(replay_buffer)}")
 
         # -------------------------------------------------------------------
         # EA actor evaluation — concurrent (lines 6-7)
         # -------------------------------------------------------------------
-        ea_fitness = _eval_concurrent(
+        ea_fitness, ea_frames = _eval_concurrent(
             [_ea_policy(a) for a in ea_pop],
-            ea_envs, replay_buffer, cfg.EVAL_STEPS, cfg.DEVICE,
+            ea_envs, replay_buffer, cfg.DEVICE,
             label="EA",
         )
+        total_frames += ea_frames
 
         # -------------------------------------------------------------------
         # EA evolution (lines 8-15)
@@ -196,11 +193,12 @@ def run_lisr(log_dir: str = "./lisr_logs"):
         # -------------------------------------------------------------------
         # Learner evaluation — concurrent (lines 25-26)
         # -------------------------------------------------------------------
-        learner_fitness = _eval_concurrent(
+        learner_fitness, learner_frames = _eval_concurrent(
             [_learner_policy(l) for l in portfolio],
-            learner_envs, replay_buffer, cfg.EVAL_STEPS, cfg.DEVICE,
+            learner_envs, replay_buffer, cfg.DEVICE,
             label="Learner",
         )
+        total_frames += learner_frames
 
         # Checkpoint best learner
         best_idx = max(range(cfg.PORTFOLIO_SIZE), key=lambda i: learner_fitness[i])

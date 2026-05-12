@@ -3,79 +3,70 @@ import torch
 import envpool
 
 
-def make_envpool_env(num_envs: int, seed: int = 0):
-    """Create a vectorised envpool HalfCheetah env."""
+def make_envpool_env(seed: int = 0):
+    """Create a single-env envpool HalfCheetah instance (Algorithm 3: one env per actor)."""
     return envpool.make(
         "HalfCheetah-v4",
         env_type="gymnasium",
-        num_envs=num_envs,
+        num_envs=1,
         seed=seed,
     )
 
 
+def evaluate_policy(policy_fn, env, replay_buffer, device: str) -> tuple[float, int]:
+    """
+    Algorithm 3: run one complete episode, store transitions in replay buffer.
+    Returns (episodic_return, num_steps).
+    """
+    obs, _ = env.reset()
+
+    ep_obs, ep_actions, ep_next_obs, ep_done = [], [], [], []
+    fitness = 0.0
+
+    while True:
+        obs_t = torch.from_numpy(obs.astype("float32")).to(device)
+        with torch.no_grad():
+            action = policy_fn(obs_t)
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = bool(terminated[0] or truncated[0])
+
+        ep_obs.append(obs[0].astype("float32"))
+        ep_actions.append(action[0].astype("float32"))
+        ep_next_obs.append(next_obs[0].astype("float32"))
+        ep_done.append(float(done))
+        fitness += float(reward[0])
+
+        obs = next_obs
+        if done:
+            break
+
+    replay_buffer.add_batch(
+        np.array(ep_obs,      dtype=np.float32),
+        np.array(ep_actions,  dtype=np.float32),
+        np.array(ep_next_obs, dtype=np.float32),
+        np.array(ep_done,     dtype=np.float32),
+    )
+    return fitness, len(ep_obs)
+
+
 def evaluate_policy_deterministic(policy_fn, num_episodes: int, device: str) -> float:
     """
-    Evaluate a policy deterministically over complete episodes.
-    Creates a fresh single-env instance so episode boundaries are clean.
-    Returns mean episodic return — comparable to paper benchmark plots.
+    Evaluate deterministically over complete episodes — paper-comparable metric.
+    Returns mean episodic return.
     """
-    import envpool
     env = envpool.make("HalfCheetah-v4", env_type="gymnasium", num_envs=1, seed=9999)
     returns = []
     for _ in range(num_episodes):
         obs, _ = env.reset()
         ep_return = 0.0
-        done = False
-        while not done:
+        while True:
             obs_t = torch.from_numpy(obs.astype("float32")).to(device)
             with torch.no_grad():
                 action = policy_fn(obs_t)
             obs, reward, terminated, truncated, _ = env.step(action)
-            ep_return += float(reward.sum())
-            done = bool(terminated[0] or truncated[0])
+            ep_return += float(reward[0])
+            if terminated[0] or truncated[0]:
+                break
         returns.append(ep_return)
     env.close()
     return float(np.mean(returns))
-
-
-def evaluate_policy_vectorized(policy_fn, env, num_steps: int, replay_buffer, device: str) -> float:
-    """
-    Roll out policy_fn in a vectorised envpool env for num_steps steps.
-
-    policy_fn : callable (obs_tensor: Tensor (N, OBS_DIM) on device) → np.ndarray (N, ACTION_DIM)
-    num_steps : number of vectorised steps; total interactions = num_steps × num_envs
-    Returns   : per-env average extrinsic reward.
-
-    Transitions are batched locally and inserted in one replay-buffer write.
-    """
-    obs, _ = env.reset()          # (N, OBS_DIM) float64
-    num_envs  = obs.shape[0]
-    obs_dim   = obs.shape[1]
-
-    all_obs      = np.empty((num_steps * num_envs, obs_dim), dtype=np.float32)
-    all_next_obs = np.empty((num_steps * num_envs, obs_dim), dtype=np.float32)
-    all_actions  = np.empty((num_steps * num_envs, 6),       dtype=np.float32)
-    all_done     = np.empty(num_steps * num_envs,             dtype=np.float32)
-
-    total_reward = 0.0
-
-    for step in range(num_steps):
-        obs_tensor = torch.from_numpy(obs.astype(np.float32)).to(device)
-
-        with torch.no_grad():
-            actions = policy_fn(obs_tensor)     # np.ndarray (N, 6)
-
-        next_obs, reward, terminated, truncated, _ = env.step(actions)
-        done = np.logical_or(terminated, truncated).astype(np.float32)
-
-        sl = slice(step * num_envs, (step + 1) * num_envs)
-        all_obs[sl]      = obs.astype(np.float32)
-        all_next_obs[sl] = next_obs.astype(np.float32)
-        all_actions[sl]  = actions.astype(np.float32)
-        all_done[sl]     = done
-
-        total_reward += float(reward.sum())
-        obs = next_obs
-
-    replay_buffer.add_batch(all_obs, all_actions, all_next_obs, all_done)
-    return total_reward / num_envs
