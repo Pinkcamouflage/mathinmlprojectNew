@@ -13,6 +13,7 @@ Parallelism strategy
   to keep synchronisation overhead negligible.
 """
 
+import csv
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -125,8 +126,13 @@ def run_lisr(log_dir: str = "./lisr_logs"):
     ea_envs      = [make_envpool_env(seed=i)       for i in range(cfg.EA_POP_SIZE)]
     learner_envs = [make_envpool_env(seed=100 + i) for i in range(cfg.PORTFOLIO_SIZE)]
 
-    with open(log_path, "w") as f:
-        f.write("generation,frames,mean_ea_fitness,best_ea_fitness,mean_learner_fitness,best_learner_fitness,eval_return,buffer_size\n")
+    learner_headers = [f"learner_{i}_tree_fitness" for i in range(cfg.PORTFOLIO_SIZE)]
+    with open(log_path, "w", newline="") as f:
+        csv.writer(f).writerow(
+            ["generation", "frames", "mean_ea_fitness", "best_ea_fitness",
+             "mean_learner_fitness", "best_learner_fitness", "eval_return", "buffer_size"]
+            + learner_headers
+        )
 
     print(f"Frame budget      : {cfg.MAX_FRAMES:,}")
 
@@ -199,6 +205,7 @@ def run_lisr(log_dir: str = "./lisr_logs"):
             label="Learner",
         )
         total_frames += learner_frames
+        learner_tree_strings = [repr(l.symbolic_tree) for l in portfolio]
 
         # Checkpoint best learner
         best_idx = max(range(cfg.PORTFOLIO_SIZE), key=lambda i: learner_fitness[i])
@@ -244,9 +251,16 @@ def run_lisr(log_dir: str = "./lisr_logs"):
         print(f"  Best EA={best_ea:.1f}  Mean EA={mean_ea:.1f}  "
               f"Best Learner={best_l:.1f}  Mean Learner={mean_l:.1f}  "
               f"Eval return={eval_return:.1f}  Overall best={best_learner_fitness:.1f}")
-        with open(log_path, "a") as f:
-            f.write(f"{gen},{total_frames},{mean_ea:.2f},{best_ea:.2f},"
-                    f"{mean_l:.2f},{best_l:.2f},{eval_return:.2f},{len(replay_buffer)}\n")
+        learner_cells = [
+            f"{learner_tree_strings[i]} ({learner_fitness[i]:.1f})"
+            for i in range(cfg.PORTFOLIO_SIZE)
+        ]
+        with open(log_path, "a", newline="") as f:
+            csv.writer(f).writerow(
+                [gen, total_frames, f"{mean_ea:.2f}", f"{best_ea:.2f}",
+                 f"{mean_l:.2f}", f"{best_l:.2f}", f"{eval_return:.2f}", len(replay_buffer)]
+                + learner_cells
+            )
 
     # Cleanup
     for env in ea_envs + learner_envs:

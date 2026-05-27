@@ -38,7 +38,7 @@ EXPLORATION_STEPS = 5000
 # Replay buffer
 BUFFER_SIZE = 1_000_000
 
-GRAD_STEPS_PER_GEN = 200
+GRAD_STEPS_PER_GEN = 1000
 MAX_FRAMES = 75_000_000
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

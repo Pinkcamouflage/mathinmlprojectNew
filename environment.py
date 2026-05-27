@@ -8,7 +8,7 @@ def make_envpool_env(seed: int = 0):
     return envpool.make(
         "HalfCheetah-v4",
         env_type="gymnasium",
-        num_envs=1,
+        num_envs=8,
         seed=seed,
     )
 
