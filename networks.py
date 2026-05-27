@@ -31,20 +31,26 @@ class GaussianPolicy(nn.Module):
         self.mean_head    = nn.Linear(hidden_size, action_dim)
         self.log_std_head = nn.Linear(hidden_size, action_dim)
 
-    def forward(self, obs: torch.Tensor):
-        """Returns (action (B,A), log_prob (B,)) via reparameterization."""
+    def forward(self, obs: torch.Tensor, noise: torch.Tensor | None = None):
+        """Returns (action (B,A), log_prob (B,)) via reparameterization.
+
+        Accepts optional pre-sampled `noise` for vmap compatibility (vmap
+        cannot handle in-place randomness from Distribution.rsample).
+        When noise is None the eager path samples internally.
+        """
         h = self.trunk(obs)
         mean    = self.mean_head(h)
         log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
         std     = log_std.exp()
 
-        dist  = torch.distributions.Normal(mean, std)
-        x_t   = dist.rsample()
+        if noise is None:
+            noise = torch.randn_like(mean)
+        x_t    = mean + std * noise
         action = torch.tanh(x_t)
 
         # log prob with tanh correction (numerically stable)
-        log_prob = dist.log_prob(x_t) - torch.log(1.0 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(dim=-1)
+        log_prob = (-0.5 * noise ** 2 - log_std - 0.9189).sum(dim=-1) \
+                   - torch.log1p(-action.pow(2) + 1e-6).sum(dim=-1)
         return action, log_prob
 
     @torch.no_grad()

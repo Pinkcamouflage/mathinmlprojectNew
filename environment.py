@@ -2,71 +2,89 @@ import numpy as np
 import torch
 import envpool
 
+import config as cfg
 
-def make_envpool_env(seed: int = 0):
-    """Create a single-env envpool HalfCheetah instance (Algorithm 3: one env per actor)."""
+
+def make_envpool_env(seed: int = 0, num_envs: int | None = None):
+    """Create an envpool HalfCheetah instance with `num_envs` parallel environments."""
+    if num_envs is None:
+        num_envs = cfg.NUM_EVAL_ENVS
     return envpool.make(
         "HalfCheetah-v4",
         env_type="gymnasium",
-        num_envs=8,
+        num_envs=num_envs,
+        num_threads=cfg.ENVPOOL_THREADS,
         seed=seed,
     )
 
 
 def evaluate_policy(policy_fn, env, replay_buffer, device: str) -> tuple[float, int]:
     """
-    Algorithm 3: run one complete episode, store transitions in replay buffer.
-    Returns (episodic_return, num_steps).
+    Algorithm 3 (vectorised): run one synchronised episode across all parallel
+    envs and store every transition in the shared replay buffer.
+
+    HalfCheetah has no early termination, so all envs truncate together at the
+    time limit; the rollout stops on the first `done`. Fitness is the mean
+    undiscounted episodic return across the parallel envs — a lower-variance
+    estimate of the same quantity the paper uses.
+
+    Returns (mean episodic return, frames collected = steps * num_envs).
     """
     obs, _ = env.reset()
+    num_envs = obs.shape[0]
 
     ep_obs, ep_actions, ep_next_obs, ep_done = [], [], [], []
-    fitness = 0.0
+    returns = np.zeros(num_envs, dtype=np.float64)
+    steps = 0
 
     while True:
         obs_t = torch.from_numpy(obs.astype("float32")).to(device)
         with torch.no_grad():
             action = policy_fn(obs_t)
         next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = bool(terminated[0] or truncated[0])
+        done = np.logical_or(terminated, truncated)
 
-        ep_obs.append(obs[0].astype("float32"))
-        ep_actions.append(action[0].astype("float32"))
-        ep_next_obs.append(next_obs[0].astype("float32"))
-        ep_done.append(float(done))
-        fitness += float(reward[0])
+        ep_obs.append(obs.astype("float32"))
+        ep_actions.append(action.astype("float32"))
+        ep_next_obs.append(next_obs.astype("float32"))
+        ep_done.append(done.astype("float32"))
+        returns += reward
+        steps += 1
 
         obs = next_obs
-        if done:
+        if done.any():
             break
 
     replay_buffer.add_batch(
-        np.array(ep_obs,      dtype=np.float32),
-        np.array(ep_actions,  dtype=np.float32),
-        np.array(ep_next_obs, dtype=np.float32),
-        np.array(ep_done,     dtype=np.float32),
+        np.concatenate(ep_obs,      axis=0),
+        np.concatenate(ep_actions,  axis=0),
+        np.concatenate(ep_next_obs, axis=0),
+        np.concatenate(ep_done,     axis=0),
     )
-    return fitness, len(ep_obs)
+    return float(returns.mean()), steps * num_envs
 
 
 def evaluate_policy_deterministic(policy_fn, num_episodes: int, device: str) -> float:
     """
-    Evaluate deterministically over complete episodes — paper-comparable metric.
-    Returns mean episodic return.
+    Run `num_episodes` parallel episodes in one batched rollout — paper-comparable
+    episodic return. Returns the mean return.
     """
-    env = envpool.make("HalfCheetah-v4", env_type="gymnasium", num_envs=1, seed=9999)
-    returns = []
-    for _ in range(num_episodes):
-        obs, _ = env.reset()
-        ep_return = 0.0
-        while True:
-            obs_t = torch.from_numpy(obs.astype("float32")).to(device)
-            with torch.no_grad():
-                action = policy_fn(obs_t)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            ep_return += float(reward[0])
-            if terminated[0] or truncated[0]:
-                break
-        returns.append(ep_return)
+    env = envpool.make(
+        "HalfCheetah-v4",
+        env_type="gymnasium",
+        num_envs=num_episodes,
+        num_threads=cfg.ENVPOOL_THREADS,
+        seed=9999,
+    )
+    obs, _ = env.reset()
+    returns = np.zeros(num_episodes, dtype=np.float64)
+    while True:
+        obs_t = torch.from_numpy(obs.astype("float32")).to(device)
+        with torch.no_grad():
+            action = policy_fn(obs_t)
+        obs, reward, terminated, truncated, _ = env.step(action)
+        returns += reward
+        if np.logical_or(terminated, truncated).any():
+            break
     env.close()
-    return float(np.mean(returns))
+    return float(returns.mean())

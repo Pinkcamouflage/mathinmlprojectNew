@@ -1,13 +1,14 @@
 import copy
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import functional_call, stack_module_state, grad, vmap
 
 from networks import GaussianPolicy, MLPQNetwork
 from symbolic_tree import SymbolicNode
 
 
-def _soft_update(target: torch.nn.Module, source: torch.nn.Module, tau: float):
+def _soft_update(target: nn.Module, source: nn.Module, tau: float):
     for tp, sp in zip(target.parameters(), source.parameters()):
         tp.data.mul_(1.0 - tau).add_(tau * sp.data)
 
@@ -28,9 +29,9 @@ class SRLearner:
         self.cfg = cfg
         dev = cfg.DEVICE
 
-        self.actor    = GaussianPolicy(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(dev)
-        self.q1       = MLPQNetwork(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(dev)
-        self.q2       = MLPQNetwork(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(dev)
+        self.actor     = GaussianPolicy(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(dev)
+        self.q1        = MLPQNetwork(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(dev)
+        self.q2        = MLPQNetwork(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(dev)
         self.q1_target = copy.deepcopy(self.q1)
         self.q2_target = copy.deepcopy(self.q2)
         for net in (self.q1_target, self.q2_target):
@@ -38,7 +39,8 @@ class SRLearner:
                 p.requires_grad_(False)
 
         self.log_alpha = torch.tensor(
-            np.log(cfg.ALPHA_INIT), dtype=torch.float32, device=dev, requires_grad=True
+            float(torch.log(torch.tensor(cfg.ALPHA_INIT))),
+            dtype=torch.float32, device=dev, requires_grad=True
         )
 
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.LR_ACTOR)
@@ -50,34 +52,26 @@ class SRLearner:
     def alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
-    def _intrinsic_reward(self, obs_np: np.ndarray, action_np: np.ndarray,
-                          next_obs_np: np.ndarray) -> torch.Tensor:
-        r_hat = self.symbolic_tree.evaluate(obs_np, action_np, next_obs_np)
-        return torch.tensor(r_hat, dtype=torch.float32, device=self.cfg.DEVICE)
-
     @torch.no_grad()
-    def act(self, obs_tensor: torch.Tensor, deterministic: bool = False) -> np.ndarray:
+    def act(self, obs_tensor: torch.Tensor, deterministic: bool = False):
         """Returns continuous actions (B, ACTION_DIM) as numpy."""
         return self.actor.act(obs_tensor, deterministic=deterministic).cpu().numpy()
 
     def update(self, batch) -> dict:
         """
         SAC update step.
-        batch: (obs, actions, next_obs, done) — all float32 numpy arrays.
+        batch: (obs, actions, next_obs, done) — all float32 tensors on cfg.DEVICE.
         """
-        obs_np, actions_np, next_obs_np, done_np = batch
+        obs, actions, next_obs, done = batch
 
-        r_hat = self._intrinsic_reward(obs_np, actions_np, next_obs_np)
-
-        dev      = self.cfg.DEVICE
-        obs      = torch.from_numpy(obs_np).to(dev)
-        actions  = torch.from_numpy(actions_np).to(dev)
-        next_obs = torch.from_numpy(next_obs_np).to(dev)
-        done     = torch.from_numpy(done_np).to(dev)
+        r_hat = self.symbolic_tree.evaluate(obs, actions, next_obs)
+        clip = self.cfg.REWARD_CLIP
+        r_hat = torch.nan_to_num(r_hat, nan=0.0, posinf=clip, neginf=-clip).clamp_(-clip, clip)
 
         # --- Q-network targets ---
         with torch.no_grad():
-            next_actions, next_log_pi = self.actor(next_obs)
+            noise = torch.randn(next_obs.shape[0], self.cfg.ACTION_DIM, device=self.cfg.DEVICE)
+            next_actions, next_log_pi = self.actor(next_obs, noise)
             min_q_next = torch.min(
                 self.q1_target(next_obs, next_actions),
                 self.q2_target(next_obs, next_actions),
@@ -94,7 +88,8 @@ class SRLearner:
         self.q2_opt.zero_grad(); q2_loss.backward(); self.q2_opt.step()
 
         # --- Update actor ---
-        new_actions, log_pi = self.actor(obs)
+        noise2 = torch.randn(obs.shape[0], self.cfg.ACTION_DIM, device=self.cfg.DEVICE)
+        new_actions, log_pi = self.actor(obs, noise2)
         min_q_pi = torch.min(self.q1(obs, new_actions), self.q2(obs, new_actions))
         actor_loss = (self.alpha.detach() * log_pi - min_q_pi).mean()
         self.actor_opt.zero_grad(); actor_loss.backward(); self.actor_opt.step()
@@ -113,3 +108,270 @@ class SRLearner:
             "actor_loss": actor_loss.item(),
             "alpha":      self.alpha.item(),
         }
+
+
+# ---------------------------------------------------------------------------
+# Vectorized SAC updater — runs all portfolio learners in parallel via vmap
+# ---------------------------------------------------------------------------
+
+class VectorizedSACUpdater:
+    """
+    Batches gradient computation across all portfolio learners simultaneously
+    using torch.func.vmap. Replaces the nested
+        for learner in portfolio:
+            for _ in range(GRAD_STEPS_PER_GEN):
+                learner.update(batch)
+    loop with 3 vectorized forward/backward passes per step.
+
+    Correctness: SAC requires separate gradient computations for each component
+    to avoid cross-contamination (e.g., actor loss must not update Q-networks).
+    This is achieved via 3 separate vmap'd grad passes:
+      Pass 1 — targets: no-grad forward to compute y = r + γ*(min_Qt - α*log_π)
+      Pass 2 — Q-grads: differentiate MSE(q_pred, y) w.r.t. Q-net params only
+      Pass 3 — actor+α grads: differentiate actor+alpha losses w.r.t. actor/alpha only
+    """
+
+    def __init__(self, learners: list, cfg):
+        self.learners = learners
+        self.cfg = cfg
+        self.n = len(learners)
+        self.dev = cfg.DEVICE
+
+        # Stateless base models used for functional_call shape reference
+        self._base_q1    = MLPQNetwork(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(self.dev)
+        self._base_q2    = MLPQNetwork(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(self.dev)
+        self._base_actor = GaussianPolicy(cfg.OBS_DIM, cfg.ACTION_DIM, cfg.HIDDEN_SIZE).to(self.dev)
+        for net in (self._base_q1, self._base_q2, self._base_actor):
+            for p in net.parameters():
+                p.requires_grad_(False)
+
+        # Stack all learner params into (N, *param_shape) tensors
+        self._stacked_q1_params,    self._stacked_q1_bufs    = stack_module_state([l.q1    for l in learners])
+        self._stacked_q2_params,    self._stacked_q2_bufs    = stack_module_state([l.q2    for l in learners])
+        self._stacked_actor_params, self._stacked_actor_bufs = stack_module_state([l.actor for l in learners])
+        self._stacked_q1t_params,   self._stacked_q1t_bufs   = stack_module_state([l.q1_target for l in learners])
+        self._stacked_q2t_params,   self._stacked_q2t_bufs   = stack_module_state([l.q2_target for l in learners])
+
+        # log_alpha per learner — shape (N,)
+        self._log_alphas = torch.stack([l.log_alpha.detach().clone() for l in learners]).to(self.dev)
+        self._log_alphas.requires_grad_(True)
+
+        # Mega-optimizers: single Adam per net type holding all N learners' params
+        self._mega_q1_opt    = torch.optim.Adam(list(self._stacked_q1_params.values()),    lr=cfg.LR_Q)
+        self._mega_q2_opt    = torch.optim.Adam(list(self._stacked_q2_params.values()),    lr=cfg.LR_Q)
+        self._mega_actor_opt = torch.optim.Adam(list(self._stacked_actor_params.values()), lr=cfg.LR_ACTOR)
+        self._alpha_opt      = torch.optim.Adam([self._log_alphas],                        lr=cfg.LR_ALPHA)
+
+        # Build the 3 vmap'd functions
+        self._vmap_targets    = self._build_target_fn()
+        self._vmap_q_grads    = self._build_q_grad_fn()
+        self._vmap_actor_grad = self._build_actor_alpha_grad_fn()
+
+    # ------------------------------------------------------------------
+    # Pass 1: compute y targets for all learners (no grad needed)
+    # ------------------------------------------------------------------
+
+    def _build_target_fn(self):
+        base_actor = self._base_actor
+        base_q1    = self._base_q1
+        base_q2    = self._base_q2
+        gamma      = self.cfg.GAMMA
+
+        def target_fn(actor_p, actor_b, q1t_p, q1t_b, q2t_p, q2t_b,
+                      la, next_obs, done, r_hat, noise_next):
+            next_a, next_lp = functional_call(base_actor, (actor_p, actor_b), (next_obs, noise_next))
+            q1t_v = functional_call(base_q1, (q1t_p, q1t_b), (next_obs, next_a))
+            q2t_v = functional_call(base_q2, (q2t_p, q2t_b), (next_obs, next_a))
+            return r_hat + gamma * (1.0 - done) * (
+                torch.minimum(q1t_v, q2t_v) - la.exp() * next_lp
+            )
+
+        return vmap(target_fn, in_dims=(0,) * 11)
+
+    # ------------------------------------------------------------------
+    # Pass 2: Q1 and Q2 gradients (targets are pre-computed and passed in)
+    # ------------------------------------------------------------------
+
+    def _build_q_grad_fn(self):
+        base_q1 = self._base_q1
+        base_q2 = self._base_q2
+
+        def q_loss_fn(q1_p, q1_b, q2_p, q2_b, obs, actions, y):
+            q1_pred = functional_call(base_q1, (q1_p, q1_b), (obs, actions))
+            q2_pred = functional_call(base_q2, (q2_p, q2_b), (obs, actions))
+            return F.mse_loss(q1_pred, y) + F.mse_loss(q2_pred, y)
+
+        # argnums=(0, 2): differentiate w.r.t. q1_p and q2_p only
+        return vmap(grad(q_loss_fn, argnums=(0, 2)), in_dims=(0,) * 7)
+
+    # ------------------------------------------------------------------
+    # Pass 3: Actor and alpha gradients
+    # Actor gradient flows through Q-networks but Q-net params are NOT in argnums.
+    # Alpha gradient uses detached log_pi so it doesn't affect actor params.
+    # Combined scalar is safe: actor_p and la are independent.
+    # ------------------------------------------------------------------
+
+    def _build_actor_alpha_grad_fn(self):
+        base_actor     = self._base_actor
+        base_q1        = self._base_q1
+        base_q2        = self._base_q2
+        target_entropy = self.cfg.TARGET_ENTROPY
+
+        def actor_alpha_loss_fn(actor_p, actor_b, q1_p, q1_b, q2_p, q2_b,
+                                la, obs, noise_actor):
+            alpha = la.exp()
+            new_a, lp = functional_call(base_actor, (actor_p, actor_b), (obs, noise_actor))
+            # q1_p and q2_p NOT in argnums: gradients flow through them to actor_p only
+            q1_v = functional_call(base_q1, (q1_p, q1_b), (obs, new_a))
+            q2_v = functional_call(base_q2, (q2_p, q2_b), (obs, new_a))
+            actor_loss = (alpha.detach() * lp - torch.minimum(q1_v, q2_v)).mean()
+            # lp detached: alpha grad does not affect actor params
+            alpha_loss = -(la * (lp.detach() + target_entropy)).mean()
+            return actor_loss + alpha_loss
+
+        # argnums=(0, 6): differentiate w.r.t. actor_p and la only
+        return vmap(grad(actor_alpha_loss_fn, argnums=(0, 6)), in_dims=(0,) * 9)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update_all(self, batch) -> dict:
+        """
+        Run one SAC gradient step for all N learners in parallel.
+        batch: (obs, actions, next_obs, done) tensors on device, shape (N*B, ...).
+        """
+        obs_flat, actions_flat, next_obs_flat, done_flat = batch
+        B = obs_flat.shape[0] // self.n
+
+        obs      = obs_flat.view(self.n, B, -1)
+        actions  = actions_flat.view(self.n, B, -1)
+        next_obs = next_obs_flat.view(self.n, B, -1)
+        done     = done_flat.view(self.n, B)
+
+        # Intrinsic reward per learner (sequential — small cost vs gradient passes)
+        r_hat = torch.stack([
+            self.learners[i].symbolic_tree.evaluate(obs[i], actions[i], next_obs[i])
+            for i in range(self.n)
+        ])  # (N, B)
+        # Symbolic rewards are unbounded; sanitise NaN/inf and clamp before use.
+        clip = self.cfg.REWARD_CLIP
+        r_hat = torch.nan_to_num(r_hat, nan=0.0, posinf=clip, neginf=-clip).clamp_(-clip, clip)
+
+        noise_next  = torch.randn(self.n, B, self.cfg.ACTION_DIM, device=self.dev)
+        noise_actor = torch.randn(self.n, B, self.cfg.ACTION_DIM, device=self.dev)
+
+        # Pass 1: compute y targets (no grad)
+        with torch.no_grad():
+            y = self._vmap_targets(
+                self._stacked_actor_params, self._stacked_actor_bufs,
+                self._stacked_q1t_params,   self._stacked_q1t_bufs,
+                self._stacked_q2t_params,   self._stacked_q2t_bufs,
+                self._log_alphas,
+                next_obs, done, r_hat, noise_next,
+            )  # (N, B)
+
+        # Pass 2: Q gradients
+        grads_q1, grads_q2 = self._vmap_q_grads(
+            self._stacked_q1_params, self._stacked_q1_bufs,
+            self._stacked_q2_params, self._stacked_q2_bufs,
+            obs, actions, y,
+        )
+        gc = self.cfg.GRAD_CLIP
+        for param, g in zip(self._stacked_q1_params.values(), grads_q1.values()):
+            param.grad = torch.nan_to_num(g, nan=0.0, posinf=gc, neginf=-gc).clamp_(-gc, gc)
+        self._mega_q1_opt.step()
+        self._mega_q1_opt.zero_grad()
+
+        for param, g in zip(self._stacked_q2_params.values(), grads_q2.values()):
+            param.grad = torch.nan_to_num(g, nan=0.0, posinf=gc, neginf=-gc).clamp_(-gc, gc)
+        self._mega_q2_opt.step()
+        self._mega_q2_opt.zero_grad()
+
+        # Pass 3: Actor + alpha gradients
+        grads_actor, grads_alpha = self._vmap_actor_grad(
+            self._stacked_actor_params, self._stacked_actor_bufs,
+            self._stacked_q1_params,   self._stacked_q1_bufs,
+            self._stacked_q2_params,   self._stacked_q2_bufs,
+            self._log_alphas,
+            obs, noise_actor,
+        )
+        for param, g in zip(self._stacked_actor_params.values(), grads_actor.values()):
+            param.grad = torch.nan_to_num(g, nan=0.0, posinf=gc, neginf=-gc).clamp_(-gc, gc)
+        self._mega_actor_opt.step()
+        self._mega_actor_opt.zero_grad()
+
+        self._log_alphas.grad = torch.nan_to_num(grads_alpha, nan=0.0, posinf=gc, neginf=-gc).clamp_(-gc, gc)
+        self._alpha_opt.step()
+        self._alpha_opt.zero_grad()
+
+        # Soft-update stacked target networks
+        tau = self.cfg.TAU
+        for name in self._stacked_q1_params:
+            self._stacked_q1t_params[name].data.mul_(1.0 - tau).add_(
+                tau * self._stacked_q1_params[name].data)
+        for name in self._stacked_q2_params:
+            self._stacked_q2t_params[name].data.mul_(1.0 - tau).add_(
+                tau * self._stacked_q2_params[name].data)
+
+        return {}
+
+    def sync_to_learners(self):
+        """Write stacked param tensors back to individual SRLearner networks.
+
+        Must be called before: checkpointing, environment evaluation, portfolio
+        evolution that reads learner network weights.
+        """
+        for i, learner in enumerate(self.learners):
+            for name, stacked in self._stacked_q1_params.items():
+                _get_param(learner.q1, name).data.copy_(stacked[i])
+            for name, stacked in self._stacked_q1t_params.items():
+                _get_param(learner.q1_target, name).data.copy_(stacked[i])
+            for name, stacked in self._stacked_q2_params.items():
+                _get_param(learner.q2, name).data.copy_(stacked[i])
+            for name, stacked in self._stacked_q2t_params.items():
+                _get_param(learner.q2_target, name).data.copy_(stacked[i])
+            for name, stacked in self._stacked_actor_params.items():
+                _get_param(learner.actor, name).data.copy_(stacked[i])
+            learner.log_alpha.data.copy_(self._log_alphas[i])
+
+    def sync_from_learners(self):
+        """Reload stacked params from individual SRLearner networks.
+
+        Must be called after portfolio evolution reassigns learners (e.g. after
+        tree evolution swaps which SRLearner objects are in the portfolio list).
+        """
+        q1_p, _  = stack_module_state([l.q1        for l in self.learners])
+        q2_p, _  = stack_module_state([l.q2        for l in self.learners])
+        a_p,  _  = stack_module_state([l.actor     for l in self.learners])
+        q1t_p, _ = stack_module_state([l.q1_target for l in self.learners])
+        q2t_p, _ = stack_module_state([l.q2_target for l in self.learners])
+
+        for name in self._stacked_q1_params:
+            self._stacked_q1_params[name].data.copy_(q1_p[name])
+        for name in self._stacked_q2_params:
+            self._stacked_q2_params[name].data.copy_(q2_p[name])
+        for name in self._stacked_actor_params:
+            self._stacked_actor_params[name].data.copy_(a_p[name])
+        for name in self._stacked_q1t_params:
+            self._stacked_q1t_params[name].data.copy_(q1t_p[name])
+        for name in self._stacked_q2t_params:
+            self._stacked_q2t_params[name].data.copy_(q2t_p[name])
+
+        new_alphas = torch.stack([l.log_alpha.detach().clone() for l in self.learners])
+        self._log_alphas.data.copy_(new_alphas)
+
+        # Rebuild mega-optimizers with fresh parameter references
+        self._mega_q1_opt    = torch.optim.Adam(list(self._stacked_q1_params.values()),    lr=self.cfg.LR_Q)
+        self._mega_q2_opt    = torch.optim.Adam(list(self._stacked_q2_params.values()),    lr=self.cfg.LR_Q)
+        self._mega_actor_opt = torch.optim.Adam(list(self._stacked_actor_params.values()), lr=self.cfg.LR_ACTOR)
+        self._alpha_opt      = torch.optim.Adam([self._log_alphas],                        lr=self.cfg.LR_ALPHA)
+
+
+def _get_param(module: nn.Module, name: str) -> nn.Parameter:
+    """Navigate dotted name like 'net.0.weight' to the actual parameter."""
+    parts = name.split('.')
+    obj = module
+    for p in parts[:-1]:
+        obj = getattr(obj, p)
+    return getattr(obj, parts[-1])

@@ -1,6 +1,10 @@
 import numpy as np
 import random
 
+import torch
+
+import config as cfg
+
 
 # ------------------------------------------------------------------
 # Operator catalogue (paper appendix)
@@ -22,46 +26,39 @@ ARITY = {
 
 OPERATORS = list(ARITY.keys())
 
-TERMINALS = [
-    "obs_mean", "obs_std", "obs_norm",
-    "next_obs_mean", "next_obs_std", "next_obs_norm",
-    "obs_diff_mean",
-    "action_mean", "action_norm",
-    "const",
-]
+# Per-dimension state/action terminals (paper: tree maps s_i, a_i, s'_i to a scalar).
+TERMINALS = (
+    [f"obs_{i}"      for i in range(cfg.OBS_DIM)]
+    + [f"next_obs_{i}" for i in range(cfg.OBS_DIM)]
+    + [f"action_{i}"   for i in range(cfg.ACTION_DIM)]
+    + ["const"]
+)
 
 
 # ------------------------------------------------------------------
-# Vectorised primitive implementations
+# Vectorised primitive implementations (GPU-native via PyTorch)
 # ------------------------------------------------------------------
 
 def _add(a, b):           return a + b
 def _subtract(a, b):      return a - b
 def _multiply(a, b):      return a * b
-def _max(a, b):           return np.maximum(a, b)
-def _min(a, b):           return np.minimum(a, b)
-def _pass_greater(a, b):  return np.where(a > b, a, b)
-def _pass_smaller(a, b):  return np.where(a < b, a, b)
-def _equal_to(a, b):      return (a == b).astype(np.float32)
-def _protected_div(a, b):
-    with np.errstate(divide="ignore", invalid="ignore"):
-        x = np.divide(a, b)
-    if isinstance(x, np.ndarray):
-        x = np.where(np.isfinite(x), x, 1.0).astype(np.float32)
-    else:
-        x = 1.0 if not np.isfinite(x) else x
-    return x
+def _max(a, b):           return torch.maximum(a, b)
+def _min(a, b):           return torch.minimum(a, b)
+def _pass_greater(a, b):  return torch.where(a > b, a, b)
+def _pass_smaller(a, b):  return torch.where(a < b, a, b)
+def _equal_to(a, b):      return (a == b).float()
+def _protected_div(a, b): return torch.nan_to_num(a / b, nan=1.0, posinf=1.0, neginf=1.0)
 
-def _cos(a):              return np.cos(a)
-def _sin(a):              return np.sin(a)
-def _tan(a):              return np.tan(a)
+def _cos(a):              return torch.cos(a)
+def _sin(a):              return torch.sin(a)
+def _tan(a):              return torch.tan(a)
 def _square(a):           return a * a
-def _is_negative(a):      return (a < 0).astype(np.float32)
+def _is_negative(a):      return (a < 0).float()
 def _div_by_100(a):       return a / 100.0
 def _div_by_10(a):        return a / 10.0
 
 def _gate(left, right, condition):
-    return np.where(condition <= 0, left, right)
+    return torch.where(condition <= 0, left, right)
 
 
 _OP_FNS = {
@@ -89,37 +86,25 @@ class SymbolicNode:
     def is_leaf(self):
         return len(self.children) == 0
 
-    def evaluate(self, obs: np.ndarray, action: np.ndarray, next_obs: np.ndarray) -> np.ndarray:
+    def evaluate(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor) -> torch.Tensor:
         """
-        obs, next_obs : (B, OBS_DIM) float32
-        action        : (B, ACTION_DIM) float32 in [-1, 1]
-        returns       : (B,) float32
+        obs, next_obs : (B, OBS_DIM) float32 tensor
+        action        : (B, ACTION_DIM) float32 tensor in [-1, 1]
+        returns       : (B,) float32 tensor
         """
         v = self.value
         if v in _OP_FNS:
             child_vals = [c.evaluate(obs, action, next_obs) for c in self.children]
-            return _OP_FNS[v](*child_vals).astype(np.float32, copy=False)
+            return _OP_FNS[v](*child_vals)
 
-        if v == "obs_mean":
-            return obs.mean(axis=1).astype(np.float32)
-        if v == "obs_std":
-            return obs.std(axis=1).astype(np.float32)
-        if v == "obs_norm":
-            return (np.linalg.norm(obs, axis=1) / np.sqrt(obs.shape[1])).astype(np.float32)
-        if v == "next_obs_mean":
-            return next_obs.mean(axis=1).astype(np.float32)
-        if v == "next_obs_std":
-            return next_obs.std(axis=1).astype(np.float32)
-        if v == "next_obs_norm":
-            return (np.linalg.norm(next_obs, axis=1) / np.sqrt(next_obs.shape[1])).astype(np.float32)
-        if v == "obs_diff_mean":
-            return np.abs(next_obs - obs).mean(axis=1).astype(np.float32)
-        if v == "action_mean":
-            return action.mean(axis=1).astype(np.float32)
-        if v == "action_norm":
-            return (np.linalg.norm(action, axis=1) / np.sqrt(action.shape[1])).astype(np.float32)
         if v == "const":
-            return np.full(obs.shape[0], self.const_val, dtype=np.float32)
+            return torch.full((obs.shape[0],), self.const_val, dtype=torch.float32, device=obs.device)
+        if v.startswith("next_obs_"):
+            return next_obs[:, int(v[9:])]
+        if v.startswith("obs_"):
+            return obs[:, int(v[4:])]
+        if v.startswith("action_"):
+            return action[:, int(v[7:])]
 
         raise ValueError(f"Unknown node value: {v}")
 

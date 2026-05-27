@@ -19,7 +19,8 @@ RESET_MUT_PROB = 0.05
 # Portfolio of SR learners
 PORTFOLIO_SIZE = 25
 PORTFOLIO_ELITE_SIZE = max(1, int(round(0.07 * (PORTFOLIO_SIZE + EA_POP_SIZE))))
-MAX_TREE_DEPTH = 12
+MAX_TREE_DEPTH = 3  # paper: trees restricted to 3 operational layers
+TREE_IMMIGRANTS = 5  # fresh random trees injected each generation to fight premature convergence
 
 # SAC hyperparameters (continuous control)
 GAMMA = 0.99
@@ -35,10 +36,23 @@ TARGET_ENTROPY = -float(ACTION_DIM)  # standard SAC heuristic: -|A|
 BATCH_SIZE = 256
 EXPLORATION_STEPS = 5000
 
+# Numerical stability: symbolic rewards are unbounded (tan, square, multiply can
+# explode), which destabilises the Q-targets and can NaN the networks.
+REWARD_CLIP = 1000.0  # sanitise + clamp r_hat to [-REWARD_CLIP, REWARD_CLIP]
+GRAD_CLIP   = 10.0     # clamp per-element gradients as a safety net
+
+# Rollout parallelism
+NUM_EVAL_ENVS   = 8    # parallel envs stepped per actor evaluation (all are used)
+ENVPOOL_THREADS = 1    # C++ threads per envpool instance; cross-actor parallelism
+                       # comes from the ThreadPoolExecutor below
+NUM_EVAL_WORKERS = 12  # concurrent actor rollouts == physical cores
+EVAL_EVERY    = 5      # run the deterministic champion eval every N generations
+EVAL_EPISODES = 5      # parallel episodes per deterministic eval
+
 # Replay buffer
 BUFFER_SIZE = 1_000_000
 
 GRAD_STEPS_PER_GEN = 1000
-MAX_FRAMES = 75_000_000
+MAX_FRAMES = 150_000_000  # paper: 150M frames for continuous control
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
