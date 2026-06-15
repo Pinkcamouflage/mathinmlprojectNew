@@ -1,0 +1,5 @@
+# Additive deps for the tree-VAE (on top of the repo-root requirements.txt).
+matplotlib>=3.8
+scikit-learn>=1.4
+# Optional: nicer 2-D projection than PCA. Falls back to PCA if absent.
+# umap-learn>=0.5
