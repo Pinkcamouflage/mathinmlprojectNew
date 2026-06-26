@@ -152,6 +152,12 @@ class VectorizedSACUpdater:
         self._stacked_q1t_params,   self._stacked_q1t_bufs   = stack_module_state([l.q1_target for l in learners])
         self._stacked_q2t_params,   self._stacked_q2t_bufs   = stack_module_state([l.q2_target for l in learners])
 
+        # Reward computation is grouped by IDENTICAL tree: each distinct reward is
+        # evaluated once over all learners that share it (one batched op group
+        # instead of one per learner). Huge win on a grid where many points decode
+        # to the same tree. Rebuilt in sync_from_learners() when trees change.
+        self._build_reward_groups()
+
         # log_alpha per learner — shape (N,)
         self._log_alphas = torch.stack([l.log_alpha.detach().clone() for l in learners]).to(self.dev)
         self._log_alphas.requires_grad_(True)
@@ -236,6 +242,48 @@ class VectorizedSACUpdater:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _tree_key(node):
+        """Exact structural key (value + const + child keys) for grouping identical trees."""
+        if not node.children:
+            return (node.value, node.const_val)
+        return (node.value, tuple(VectorizedSACUpdater._tree_key(c) for c in node.children))
+
+    def _build_reward_groups(self):
+        """Group learners by identical reward tree -> (compiled_fn, learner-index tensor)."""
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i, l in enumerate(self.learners):
+            groups[self._tree_key(l.symbolic_tree)].append(i)
+        self._reward_groups = [
+            (self.learners[idxs[0]].symbolic_tree.compile_eval(),
+             torch.tensor(idxs, dtype=torch.long, device=self.dev))
+            for idxs in groups.values()
+        ]
+
+    @torch.no_grad()
+    def act_all(self, obs, deterministic: bool = False):
+        """Vectorized policy for all N learners in one vmapped forward.
+
+        obs: (N, P, OBS_DIM) tensor on device (P = envs/episodes per learner).
+        Returns numpy (N, P, ACTION_DIM). Deterministic uses zero noise, i.e.
+        tanh(mean) — identical to GaussianPolicy.act(deterministic=True).
+        """
+        base_actor = self._base_actor
+
+        def act_fn(actor_p, actor_b, o, noise):
+            a, _ = functional_call(base_actor, (actor_p, actor_b), (o, noise))
+            return a
+
+        P = obs.shape[1]
+        if deterministic:
+            noise = torch.zeros(self.n, P, self.cfg.ACTION_DIM, device=self.dev)
+        else:
+            noise = torch.randn(self.n, P, self.cfg.ACTION_DIM, device=self.dev)
+        actions = vmap(act_fn, in_dims=(0, 0, 0, 0))(
+            self._stacked_actor_params, self._stacked_actor_bufs, obs, noise)
+        return actions.cpu().numpy()
+
     def update_all(self, batch) -> dict:
         """
         Run one SAC gradient step for all N learners in parallel.
@@ -249,11 +297,17 @@ class VectorizedSACUpdater:
         next_obs = next_obs_flat.view(self.n, B, -1)
         done     = done_flat.view(self.n, B)
 
-        # Intrinsic reward per learner (sequential — small cost vs gradient passes)
-        r_hat = torch.stack([
-            self.learners[i].symbolic_tree.evaluate(obs[i], actions[i], next_obs[i])
-            for i in range(self.n)
-        ])  # (N, B)
+        # Intrinsic reward, grouped by identical tree: evaluate each distinct reward
+        # once over the stacked batches of all learners that share it (far fewer
+        # kernel launches than one evaluation per learner). Elementwise ops over the
+        # batch dim make the concatenation exact.
+        r_hat = obs.new_empty((self.n, B))
+        for fn, idx in self._reward_groups:
+            g = idx.shape[0]
+            oi = obs.index_select(0, idx).reshape(g * B, -1)
+            ai = actions.index_select(0, idx).reshape(g * B, -1)
+            ni = next_obs.index_select(0, idx).reshape(g * B, -1)
+            r_hat.index_copy_(0, idx, fn(oi, ai, ni).reshape(g, B))
         # Symbolic rewards are unbounded; sanitise NaN/inf and clamp before use.
         clip = self.cfg.REWARD_CLIP
         r_hat = torch.nan_to_num(r_hat, nan=0.0, posinf=clip, neginf=-clip).clamp_(-clip, clip)
@@ -360,6 +414,9 @@ class VectorizedSACUpdater:
 
         new_alphas = torch.stack([l.log_alpha.detach().clone() for l in self.learners])
         self._log_alphas.data.copy_(new_alphas)
+
+        # Trees may have changed with the portfolio — regroup + recompile rewards.
+        self._build_reward_groups()
 
         # Rebuild mega-optimizers with fresh parameter references
         self._mega_q1_opt    = torch.optim.Adam(list(self._stacked_q1_params.values()),    lr=self.cfg.LR_Q)

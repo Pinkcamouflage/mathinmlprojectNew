@@ -9,6 +9,7 @@ Checkpoint -> tree_vae/checkpoints/tree_vae.pt
 """
 import os
 import sys
+import math
 import random
 
 import torch
@@ -97,8 +98,18 @@ def recon_metrics(model, samples, n=300):
     }
 
 
-def train_phase(model, opt, graphs, epochs, label, samples_for_acc=None):
+def set_cosine_lr(opt, epoch, epochs):
+    """Cosine-decay the LR from C.LR down to C.LR_MIN across the phase."""
+    lr = C.LR_MIN + 0.5 * (C.LR - C.LR_MIN) * (1 + math.cos(math.pi * epoch / epochs))
+    for pg in opt.param_groups:
+        pg["lr"] = lr
+    return lr
+
+
+def train_phase(model, opt, graphs, epochs, label, samples_for_acc=None, lr_decay=False):
     for epoch in range(epochs):
+        if lr_decay:
+            set_cosine_lr(opt, epoch, epochs)
         beta = beta_for_epoch(epoch)
         ce, const, kl = run_epoch(model, opt, graphs, beta, train=True)
         msg = f"[{label}] epoch {epoch+1}/{epochs}  ce={ce:.3f} const={const:.3f} kl={kl:.2f} beta={beta:.3f}"
@@ -128,7 +139,8 @@ def main():
 
     print("\n== Fine-tuning on real trees ==")
     real_graphs = make_graphs([s.tree for s in uniq])
-    train_phase(model, opt, real_graphs, C.EPOCHS_FINETUNE, "finetune", samples_for_acc=uniq)
+    train_phase(model, opt, real_graphs, C.EPOCHS_FINETUNE, "finetune",
+                samples_for_acc=uniq, lr_decay=True)
 
     ckpt = os.path.join(C.CKPT_DIR, "tree_vae.pt")
     torch.save({"model": model.state_dict(),

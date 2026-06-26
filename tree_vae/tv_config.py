@@ -43,8 +43,10 @@ MAX_TREE_DEPTH = root_cfg.MAX_TREE_DEPTH
 # ------------------------------------------------------------------
 # Model hyperparameters
 # ------------------------------------------------------------------
-HIDDEN_DIM = 128
-LATENT_DIM = 32      # raised from 16: the log showed KL wanted ~19 nats of capacity
+HIDDEN_DIM = 192     # raised from 128: 128 underfit reconstruction (see below)
+LATENT_DIM = 48      # raised 16->32->48: capacity was the main reconstruction bottleneck.
+                     # A/B (held-out): h128/z32/b0.02 gave struct=0.29/0.21 (train/val);
+                     # h192/z48/b0.01+LRdecay gave struct=0.73/0.48 at equal budget.
 DEVICE     = "cpu"   # graphs are tiny; per-node ops are faster on CPU
 
 # ------------------------------------------------------------------
@@ -57,6 +59,8 @@ BATCH_SIZE        = 64
 LR                = 1e-3
 GRAD_CLIP         = root_cfg.GRAD_CLIP
 KL_WARMUP_EPOCHS  = 10        # linear beta warmup 0 -> BETA_MAX
-BETA_MAX          = 0.02       # lowered from 0.1: β=0.1 crushed reconstruction
-                              # (ce rose 1.72 -> 2.18 as β ramped). Natural
-                              # operating point was ce≈1.7, kl≈19.
+BETA_MAX          = 0.010      # lowered 0.1 -> 0.02 -> 0.010. β=0.1 crushed
+                              # reconstruction; 0.02 still over-regularised at the
+                              # new capacity. 0.010 keeps the latent regularised
+                              # (KL stays finite) while letting reconstruction breathe.
+LR_MIN            = 1e-4       # cosine-decay target for the fine-tune phase

@@ -5,15 +5,22 @@ import envpool
 import config as cfg
 
 
-def make_envpool_env(seed: int = 0, num_envs: int | None = None):
-    """Create an envpool HalfCheetah instance with `num_envs` parallel environments."""
+def make_envpool_env(seed: int = 0, num_envs: int | None = None,
+                     num_threads: int | None = None):
+    """Create an envpool HalfCheetah instance with `num_envs` parallel environments.
+
+    `num_threads` overrides cfg.ENVPOOL_THREADS for callers that step one large
+    pool (e.g. vectorized multi-learner evaluation) and want it spread over cores.
+    """
     if num_envs is None:
         num_envs = cfg.NUM_EVAL_ENVS
+    if num_threads is None:
+        num_threads = cfg.ENVPOOL_THREADS
     return envpool.make(
         "HalfCheetah-v4",
         env_type="gymnasium",
         num_envs=num_envs,
-        num_threads=cfg.ENVPOOL_THREADS,
+        num_threads=num_threads,
         seed=seed,
     )
 

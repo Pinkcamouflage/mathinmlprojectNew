@@ -20,6 +20,7 @@ expensive for GRID*GRID points. So we use a cheap offline stand-in:
 """
 import os
 import sys
+import time
 import argparse
 
 import numpy as np
@@ -36,7 +37,40 @@ if ROOT not in sys.path:
 import tv_config as C            # noqa: E402
 from graph import tree_to_graph  # noqa: E402
 from visualize import load_model, encode_all  # noqa: E402
+from symbolic_tree import SymbolicNode  # noqa: E402
 import data as data_mod          # noqa: E402
+
+
+# ------------------------------------------------------------------
+# Landscape center: latent mu of the "empty" reward tree
+# ------------------------------------------------------------------
+@torch.no_grad()
+def empty_tree_center(model):
+    """Latent mean of the empty/null reward: a single const(0) node.
+
+    This is the most "empty" structurally-valid tree the grammar allows
+    (reward = 0 for every (s, a, s')). Anchoring the landscape here makes the
+    origin a semantically null reward, so moving along d1/d2 shows how trees
+    grow away from "no reward".
+    """
+    g = tree_to_graph(SymbolicNode("const", const_val=0.0), device=C.DEVICE)
+    mu, _ = model.encode(g)
+    return mu.cpu().numpy().astype(np.float32)
+
+
+@torch.no_grad()
+def best_tree_center(model):
+    """Latent mean of the highest-fitness tree logged during training.
+
+    Anchoring here puts the landscape origin at the best reward the evolutionary
+    search found, so moving along d1/d2 shows the neighborhood of that optimum.
+    """
+    samples = data_mod.load_samples()
+    best = max(samples, key=lambda s: s.fitness)
+    print(f"best logged tree: fitness {best.fitness:.1f} (gen {best.generation}): {best.repr_str}")
+    g = tree_to_graph(best.tree, device=C.DEVICE)
+    mu, _ = model.encode(g)
+    return mu.cpu().numpy().astype(np.float32)
 
 
 # ------------------------------------------------------------------
@@ -50,6 +84,32 @@ def random_directions(latent, seed):
     d2 -= (d2 @ d1) * d1          # Gram-Schmidt: make d2 orthogonal to d1
     d2 /= np.linalg.norm(d2)
     return d1.astype(np.float32), d2.astype(np.float32)
+
+
+def good_bad_direction(latent, seed, tail=0.10, model=None):
+    """Unit latent direction separating good (top-tail) from bad (bottom-tail) trees.
+
+    Fitted as the logistic-regression boundary normal on the raw latent codes of
+    the logged trees; it points toward higher fitness (class = good). Walking +d1
+    along it decodes increasingly 'good' trees, -d1 increasingly 'bad' ones.
+    Returned with an orthogonal random d2 so callers still get a 2-D plane.
+    """
+    from sklearn.linear_model import LogisticRegression
+    if model is None:
+        model = load_model()
+    samples = data_mod.dedup(data_mod.load_samples())
+    z = encode_all(model, samples).astype(np.float64)
+    fit = np.array([s.fitness for s in samples])
+    lo, hi = np.quantile(fit, tail), np.quantile(fit, 1 - tail)
+    mask = (fit >= hi) | (fit <= lo)
+    y = (fit[mask] >= hi).astype(int)
+    clf = LogisticRegression(max_iter=2000).fit(z[mask], y)
+    d1 = clf.coef_[0]
+    d1 = (d1 / np.linalg.norm(d1)).astype(np.float32)
+    _, d2 = random_directions(latent, seed)          # a plane companion
+    d2 = d2 - (d2 @ d1) * d1
+    d2 = (d2 / np.linalg.norm(d2)).astype(np.float32)
+    return d1, d2
 
 
 # ------------------------------------------------------------------
@@ -82,11 +142,17 @@ def make_proxy_scorer(batch=512, seed=0):
     return score
 
 
-def make_knn_scorer(model, k=8):
-    """Distance-weighted real logged fitness of nearest encoded trees."""
+def encoded_reference(model):
+    """(mu [N, latent], fitness [N]) for every logged tree — shared by knn score+density."""
     samples = data_mod.load_samples()
     mu = encode_all(model, samples)                      # [N, latent]
     fit = np.array([s.fitness for s in samples], dtype=np.float64)
+    return mu, fit
+
+
+def make_knn_scorer(model, k=8, reference=None):
+    """Distance-weighted real logged fitness of nearest encoded trees."""
+    mu, fit = reference if reference is not None else encoded_reference(model)
 
     def score_grid(zs):                                  # zs: [G, latent]
         d2 = ((zs[:, None, :] - mu[None, :, :]) ** 2).sum(-1)   # [G, N]
@@ -97,6 +163,53 @@ def make_knn_scorer(model, k=8):
         return (w * nf).sum(1) / w.sum(1)
 
     return score_grid
+
+
+def make_knn_std(model, k=8, reference=None):
+    """Distance-weighted std of the k nearest logged fitnesses (kNN uncertainty).
+
+    Companion to make_knn_scorer, using the SAME k neighbors and weights: it is
+    the spread of exactly the logged returns that the fitness panel averages. Low
+    std = nearby trees agree (confident estimate); high std = they disagree, so
+    the kNN fitness here is uncertain even where tree density is high.
+    """
+    mu, fit = reference if reference is not None else encoded_reference(model)
+
+    def std_grid(zs):                                    # zs: [G, latent]
+        d2 = ((zs[:, None, :] - mu[None, :, :]) ** 2).sum(-1)   # [G, N]
+        idx = np.argpartition(d2, k, axis=1)[:, :k]
+        nd = np.take_along_axis(d2, idx, axis=1)
+        w = 1.0 / (np.sqrt(nd) + 1e-6)
+        nf = fit[idx]
+        wsum = w.sum(1)
+        m = (w * nf).sum(1) / wsum                       # same weighted mean as scorer
+        var = (w * (nf - m[:, None]) ** 2).sum(1) / wsum
+        return np.sqrt(np.clip(var, 0.0, None))
+
+    return std_grid
+
+
+def make_knn_density(model, k=8, reference=None):
+    """How many logged trees sit near each grid point (Gaussian-kernel density).
+
+    Companion to make_knn_scorer: high density = the kNN fitness here is an
+    interpolation over many nearby logged trees (trustworthy); low density = the
+    point is in empty latent space and the kNN estimate is extrapolation.
+
+    The kernel bandwidth is set adaptively to the median distance-to-the-k-th-
+    nearest logged tree across the grid, so it matches the same k the scorer uses
+    and avoids an O(N^2) pairwise computation over the logged set.
+    """
+    mu, _ = reference if reference is not None else encoded_reference(model)
+
+    def density_grid(zs):                                # zs: [G, latent]
+        d2 = ((zs[:, None, :] - mu[None, :, :]) ** 2).sum(-1)   # [G, N]
+        kth = np.partition(d2, k, axis=1)[:, k]          # sq dist to k-th NN per point
+        h2 = max(float(np.median(kth)), 1e-6)            # bandwidth^2
+        w = np.exp(-d2 / (2.0 * h2))
+        return w.sum(1)                                  # effective # of nearby trees
+
+    return density_grid
 
 
 # ------------------------------------------------------------------
@@ -138,6 +251,79 @@ def _eval_return(learner, env, dev):
     return float(returns.mean())
 
 
+@torch.no_grad()
+def _eval_returns_vectorized(updater, env, n, P, dev, obs_dim):
+    """Per-learner mean return, evaluating ALL n learners at once.
+
+    One envpool of n*P envs (envs [i*P:(i+1)*P] belong to learner i) stepped in
+    lockstep, with every learner's deterministic action produced in a single
+    vmapped forward. Replaces n sequential single-learner rollouts -> the env
+    stepping parallelizes across cores and the GPU does one big batch per step.
+    """
+    obs, _ = env.reset()                                   # (n*P, obs_dim)
+    returns = np.zeros(n * P, dtype=np.float64)
+    while True:
+        obs_t = torch.from_numpy(obs.astype("float32")).to(dev).view(n, P, obs_dim)
+        a = updater.act_all(obs_t, deterministic=True).reshape(n * P, -1).astype("float32")
+        obs, r, term, trunc, _ = env.step(a)
+        returns += r
+        if np.logical_or(term, trunc).any():
+            break
+    return returns.reshape(n, P).mean(1)                   # (n,)
+
+
+def _collect_vectorized(env, buffers, act_fn, steps, n, P, dev, obs_dim, act_dim):
+    """Roll out all n learners (P envs each) and route transitions to per-learner buffers.
+
+    `act_fn(obs_t[n,P,obs]) -> actions[n,P,act]` (numpy). Env e belongs to learner
+    e // P, so the n*P env block maps cleanly back to per-learner buffers.
+    """
+    obs, _ = env.reset()                                   # (n*P, obs_dim)
+    eo, ea, en, ed = [], [], [], []
+    for _ in range(steps):
+        obs_t = torch.from_numpy(obs.astype("float32")).to(dev).view(n, P, obs_dim)
+        a = act_fn(obs_t).reshape(n * P, act_dim).astype("float32")
+        nobs, _, term, trunc, _ = env.step(a)
+        done = np.logical_or(term, trunc)
+        eo.append(obs.astype("float32")); ea.append(a)
+        en.append(nobs.astype("float32")); ed.append(done.astype("float32"))
+        obs = nobs
+        if done.any():
+            obs, _ = env.reset()
+    O = np.stack(eo).reshape(steps, n, P, obs_dim)
+    A = np.stack(ea).reshape(steps, n, P, act_dim)
+    Nx = np.stack(en).reshape(steps, n, P, obs_dim)
+    D = np.stack(ed).reshape(steps, n, P)
+    for i in range(n):
+        buffers[i].add_batch(O[:, i].reshape(-1, obs_dim), A[:, i].reshape(-1, act_dim),
+                             Nx[:, i].reshape(-1, obs_dim), D[:, i].reshape(-1))
+
+
+def _sample_isolated(buffers, b, n):
+    """Sample b transitions from each per-learner buffer; concat learner-major to (n*b,...)."""
+    o, a, no, d = zip(*(bf.sample(b) for bf in buffers))
+    return torch.cat(o), torch.cat(a), torch.cat(no), torch.cat(d)
+
+
+def _fmt_hms(seconds):
+    seconds = int(max(seconds, 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+def _rss_mb():
+    """Current resident set size in MB (Linux /proc), for host-memory diagnostics."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return float("nan")
+
+
 def score_true(model, zs, args):
     """Decode every grid point, train SAC under each reward, return real returns."""
     import config as root_cfg
@@ -147,22 +333,57 @@ def score_true(model, zs, args):
 
     dev = root_cfg.DEVICE
     act_dim = root_cfg.ACTION_DIM
+    obs_dim = root_cfg.OBS_DIM
+    P = args.eval_episodes
+    threads = args.env_threads
+    # Full training-size buffer for converged-from-scratch fitness (shared mode only).
+    cap = (root_cfg.BUFFER_SIZE if (args.match_training and not args.isolated_buffers)
+           else max(args.prefill * 2, 200_000))
+
+    # Envpools are heavy host-side C++ objects; building a fresh one per chunk
+    # (79 chunks for a 100x100 grid) leaks system RAM through envpool.close() and
+    # eventually OOMs the machine mid-grid. Cache pools by (role, num_envs) and
+    # reuse them across chunks instead -> at most one full-size + one remainder
+    # pool per role for the whole run.
+    #
+    # NOTE: unlike the old per-chunk-fresh-pool code, a reused eval pool's RNG now
+    # flows continuously across chunks, so each chunk's reset states are fresh
+    # independent draws rather than the same seed-4321 draws every chunk (envpool
+    # 1.2.0's seed()+reset() is not reproducible across histories, so this cannot
+    # be replicated exactly while reusing the pool). Results stay fully
+    # reproducible run-to-run (the op sequence is deterministic); they are simply
+    # not bit-identical to the previous version.
+    _pools = {}
+
+    def get_pool(role, num_envs, seed):
+        key = (role, num_envs)
+        env = _pools.get(key)
+        if env is None:
+            env = make_envpool_env(seed=seed, num_envs=num_envs, num_threads=threads)
+            _pools[key] = env
+        return env
 
     print(f"decoding {len(zs)} grid points to trees ...")
     trees = [model.generate(torch.from_numpy(z)) for z in zs]
 
-    # Shared replay buffer, pre-filled with random-policy transitions.
-    buf = ReplayBuffer(max(args.prefill * 2, 200_000),
-                       root_cfg.OBS_DIM, act_dim, device=dev)
-    collect_env = make_envpool_env(seed=1234, num_envs=16)
-    eval_env = make_envpool_env(seed=4321, num_envs=args.eval_episodes)
-    rand_pol = lambda o: (np.random.uniform(-1, 1, (o.shape[0], act_dim))).astype("float32")
-    print(f"pre-filling replay buffer (~{args.prefill} transitions) ...")
-    while len(buf) < args.prefill:
-        _collect(collect_env, buf, rand_pol, 512, dev, act_dim)
+    # Shared-buffer setup (default). Isolated mode builds per-learner buffers per chunk.
+    if not args.isolated_buffers:
+        buf = ReplayBuffer(cap, obs_dim, act_dim, device=dev)
+        collect_env = get_pool("collect", 16, 1234)
+        rand_pol = lambda o: (np.random.uniform(-1, 1, (o.shape[0], act_dim))).astype("float32")
+        print(f"pre-filling shared replay buffer (~{args.prefill} transitions) ...")
+        while len(buf) < args.prefill:
+            _collect(collect_env, buf, rand_pol, 512, dev, act_dim)
+        mode = "shared buffer"
+    else:
+        cp = args.collect_parallel
+        mode = f"isolated buffers (collect_parallel={cp})"
+    print(f"fitness mode: {mode}; eval/collect envpool threads = {threads}")
 
     heights = np.empty(len(trees), dtype=np.float64)
     n_chunks = (len(trees) + args.chunk - 1) // args.chunk
+    log_every = args.log_every if args.log_every > 0 else max(1, args.steps // 20)
+    t_grid = time.monotonic()
     for ci in range(n_chunks):
         sl = slice(ci * args.chunk, (ci + 1) * args.chunk)
         chunk = trees[sl]
@@ -170,25 +391,62 @@ def score_true(model, zs, args):
         updater = VectorizedSACUpdater(learners, root_cfg)
         n = len(learners)
 
+        # In isolated mode every learner gets its own buffer + its own on-policy data,
+        # so no reward function ever trains on another's transitions.
+        if args.isolated_buffers:
+            cp = args.collect_parallel
+            buffers = [ReplayBuffer(cap, obs_dim, act_dim, device=dev) for _ in range(n)]
+            collect_env = get_pool("collect", n * cp, 1234)
+            rand_act = lambda o: np.random.uniform(-1, 1, (n, o.shape[1], act_dim))
+            while len(buffers[0]) < args.prefill:
+                _collect_vectorized(collect_env, buffers, rand_act, 512, n, cp,
+                                    dev, obs_dim, act_dim)
+
+        t_chunk = time.monotonic()
         for step in range(args.steps):
-            # Periodically add fresh on-policy-ish data (round-robin over learners).
             if step % args.collect_every == 0:
-                updater.sync_to_learners()
-                pol = learners[step // args.collect_every % n]
-                _collect(collect_env, buf,
-                         lambda o, _p=pol: _p.act(torch.as_tensor(o, device=dev)),
-                         args.collect_steps, dev, act_dim)
-            batch = buf.sample(n * args.batch)
+                if args.isolated_buffers:
+                    # each learner collects its OWN on-policy data (vectorized)
+                    _collect_vectorized(
+                        collect_env, buffers,
+                        lambda o: updater.act_all(o, deterministic=False),
+                        args.collect_steps, n, cp, dev, obs_dim, act_dim)
+                    batch_buf = None
+                else:
+                    # round-robin: one learner's policy feeds the shared buffer
+                    updater.sync_to_learners()
+                    pol = learners[step // args.collect_every % n]
+                    _collect(collect_env, buf,
+                             lambda o, _p=pol: _p.act(torch.as_tensor(o, device=dev)),
+                             args.collect_steps, dev, act_dim)
+            batch = (_sample_isolated(buffers, args.batch, n) if args.isolated_buffers
+                     else buf.sample(n * args.batch))
             updater.update_all(batch)
 
-        updater.sync_to_learners()
-        for i, l in enumerate(learners):
-            heights[sl.start + i] = _eval_return(l, eval_env, dev)
+            if (step + 1) % log_every == 0 or (step + 1) == args.steps:
+                el = time.monotonic() - t_chunk
+                sps = (step + 1) / el
+                eta_chunk = (args.steps - (step + 1)) / sps if sps > 0 else 0.0
+                # grid ETA = rest of this chunk + the remaining whole chunks
+                eta_grid = eta_chunk + (n_chunks - (ci + 1)) * (args.steps / sps if sps > 0 else 0.0)
+                print(f"    chunk {ci+1}/{n_chunks}  step {step+1:,}/{args.steps:,}  "
+                      f"{sps:.1f} steps/s  elapsed {_fmt_hms(el)}  "
+                      f"chunk-ETA {_fmt_hms(eta_chunk)}  grid-ETA {_fmt_hms(eta_grid)}",
+                      flush=True)
+
+        # Vectorized evaluation: all n learners at once on a reused n*P envpool.
+        eval_env = get_pool("eval", n * P, 4321)
+        heights[sl] = _eval_returns_vectorized(updater, eval_env, n, P, dev, obs_dim)
         done = min((ci + 1) * args.chunk, len(trees))
         print(f"  chunk {ci+1}/{n_chunks}: trained {n} learners x {args.steps} steps "
               f"({done}/{len(trees)} trees)  last-chunk return "
               f"min={heights[sl].min():.0f} max={heights[sl].max():.0f}")
+        if args.log_rss:
+            print(f"  [rss] after chunk {ci+1}/{n_chunks}: {_rss_mb():.0f} MB resident "
+                  f"({len(_pools)} cached envpools)", flush=True)
 
+    for env in _pools.values():
+        env.close()
     return heights.reshape(args.grid, args.grid)
 
 
@@ -213,18 +471,33 @@ def gaussian_smooth(grid, sigma):
 # ------------------------------------------------------------------
 # Plotting (steps 5 + 6)
 # ------------------------------------------------------------------
-def plot_surface(coords, height, label, out_prefix):
+def plot_surface(coords, height, label, out_prefix, density=None, std=None,
+                 axis_labels=("random direction 1", "random direction 2")):
     lin = coords
+    xlab, ylab = axis_labels
     A, B = np.meshgrid(lin, lin, indexing="xy")
 
-    # 2-D filled contour
-    plt.figure(figsize=(8, 6.5))
-    cf = plt.contourf(A, B, height, levels=40, cmap="viridis")
-    plt.colorbar(cf, label=label)
-    plt.contour(A, B, height, levels=12, colors="k", linewidths=0.3, alpha=0.4)
-    plt.title("Fitness landscape over two random latent directions")
-    plt.xlabel("random direction 1"); plt.ylabel("random direction 2")
-    plt.tight_layout(); plt.savefig(out_prefix + "_2d.png", dpi=150); plt.close()
+    # 2-D filled contour. Optional knn companion fields (density, std) are added
+    # as extra panels in the SAME figure rather than separate files.
+    panels = [(height, "viridis", label,
+               "Fitness landscape over two random latent directions", "k")]
+    if density is not None:
+        panels.append((density, "magma", "nearby logged trees (kernel density)",
+                       "Density of logged trees near each point", "w"))
+    if std is not None:
+        panels.append((std, "inferno", "kNN fitness std (spread of nearby returns)",
+                       "Uncertainty: std of nearby logged returns", "w"))
+
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(7.5 * n, 6.5), squeeze=False)
+    for ax, (field, cmap, lbl, title, ccolor) in zip(axes[0], panels):
+        cf = ax.contourf(A, B, field, levels=40, cmap=cmap)
+        fig.colorbar(cf, ax=ax, label=lbl)
+        ax.contour(A, B, field, levels=12, colors=ccolor, linewidths=0.3, alpha=0.4)
+        ax.set_title(title)
+        ax.set_xlabel(xlab); ax.set_ylabel(ylab)
+
+    fig.tight_layout(); fig.savefig(out_prefix + "_2d.png", dpi=150); plt.close(fig)
     print(f"saved {out_prefix}_2d.png")
 
     # 3-D surface
@@ -233,9 +506,9 @@ def plot_surface(coords, height, label, out_prefix):
     surf = ax.plot_surface(A, B, height, cmap="viridis", linewidth=0,
                            antialiased=True)
     fig.colorbar(surf, shrink=0.6, label=label)
-    ax.set_xlabel("random direction 1"); ax.set_ylabel("random direction 2")
+    ax.set_xlabel(xlab); ax.set_ylabel(ylab)
     ax.set_zlabel(label)
-    ax.set_title("Fitness landscape (random latent directions)")
+    ax.set_title("Fitness landscape (latent directions)")
     plt.tight_layout(); plt.savefig(out_prefix + "_3d.png", dpi=150); plt.close()
     print(f"saved {out_prefix}_3d.png")
 
@@ -247,7 +520,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="random-direction seed")
     ap.add_argument("--score", choices=["proxy", "knn", "true"], default="proxy")
     ap.add_argument("--smooth", type=float, default=1.0, help="gaussian sigma (grid cells)")
-    ap.add_argument("--center", choices=["origin", "data"], default="origin")
+    ap.add_argument("--center", choices=["origin", "data", "empty", "best"], default="empty",
+                    help="landscape center: origin | data mean | empty const(0) tree | "
+                         "best logged tree")
+    ap.add_argument("--direction", choices=["random", "good-bad"], default="random",
+                    help="axes: two random orthonormal dirs, or the good->bad "
+                         "logistic-separating axis (d1) + an orthogonal random d2")
     # --score true (actual SAC fitness) knobs — bigger chunk/batch = busier GPU
     ap.add_argument("--chunk", type=int, default=128, help="learners trained per vmap pass")
     ap.add_argument("--batch", type=int, default=256, help="SAC minibatch per learner")
@@ -256,17 +534,63 @@ def main():
     ap.add_argument("--collect-every", type=int, default=200, help="grad steps between data collection")
     ap.add_argument("--collect-steps", type=int, default=1000, help="env steps per collection round")
     ap.add_argument("--eval-episodes", type=int, default=10, help="parallel episodes per fitness eval")
+    ap.add_argument("--isolated-buffers", action="store_true",
+                    help="give each learner its own buffer + its own on-policy data "
+                         "(clean per-reward fitness; slower than the shared buffer)")
+    ap.add_argument("--collect-parallel", type=int, default=2,
+                    help="envs per learner for isolated on-policy collection")
+    ap.add_argument("--env-threads", type=int, default=min(os.cpu_count() or 4, 16),
+                    help="envpool C++ threads for the vectorized eval/collect pools")
+    ap.add_argument("--log-every", type=int, default=0,
+                    help="print grad-step progress + ETA every N steps within a chunk "
+                         "(0 = ~20 updates per chunk)")
+    ap.add_argument("--log-rss", action="store_true",
+                    help="print process resident memory (MB) after each chunk's eval "
+                         "to diagnose host-RAM growth")
+    ap.add_argument("--match-training", action="store_true",
+                    help="converged-from-scratch fitness: train each grid tree from random "
+                         "init for --train-generations x GRAD_STEPS_PER_GEN grad steps on a "
+                         "full 1M shared buffer, so returns reflect the best achievable return "
+                         "under each reward (scale-comparable to the best training fitness)")
+    ap.add_argument("--train-generations", type=int, default=375,
+                    help="reference LISR generations (150M-frame budget => 375); "
+                         "per-tree grad steps = this x GRAD_STEPS_PER_GEN")
     args = ap.parse_args()
+
+    if args.match_training:
+        args.steps = args.train_generations * C.root_cfg.GRAD_STEPS_PER_GEN
+        print(f"[match-training] converged-from-scratch: {args.train_generations} x "
+              f"{C.root_cfg.GRAD_STEPS_PER_GEN} = {args.steps:,} grad steps per tree; "
+              f"shared buffer = {C.root_cfg.BUFFER_SIZE:,}")
+        if args.batch != C.root_cfg.BATCH_SIZE:
+            print(f"[match-training] note: --batch {args.batch} != training "
+                  f"{C.root_cfg.BATCH_SIZE} (pass --batch {C.root_cfg.BATCH_SIZE} to match)")
+        if args.eval_episodes != C.root_cfg.NUM_EVAL_ENVS:
+            print(f"[match-training] note: --eval-episodes {args.eval_episodes} != training "
+                  f"{C.root_cfg.NUM_EVAL_ENVS} (pass --eval-episodes {C.root_cfg.NUM_EVAL_ENVS})")
+        if args.isolated_buffers:
+            print("[match-training] warning: --isolated-buffers needs n full buffers and will "
+                  "OOM at large --chunk; the shared buffer is recommended here.")
 
     os.makedirs(C.FIG_DIR, exist_ok=True)
     model = load_model()
     latent = model.latent
 
-    d1, d2 = random_directions(latent, args.seed)
+    if args.direction == "good-bad":
+        print("computing good->bad separating axis (encoding logged trees) ...")
+        d1, d2 = good_bad_direction(latent, args.seed, model=model)
+    else:
+        d1, d2 = random_directions(latent, args.seed)
 
     center = np.zeros(latent, dtype=np.float32)
     if args.center == "data":
         center = encode_all(model, data_mod.load_samples()).mean(0).astype(np.float32)
+    elif args.center == "empty":
+        center = empty_tree_center(model)
+        print(f"center = empty const(0) tree (latent norm {np.linalg.norm(center):.3f})")
+    elif args.center == "best":
+        center = best_tree_center(model)
+        print(f"center = best logged tree (latent norm {np.linalg.norm(center):.3f})")
 
     # Step 2: grid of latent points
     lin = np.linspace(-args.extent, args.extent, args.grid).astype(np.float32)
@@ -276,16 +600,24 @@ def main():
           + B.reshape(-1, 1) * d2[None, :]).astype(np.float32)   # [G*G, latent]
 
     # Step 3 + 4: decode each point and score it
+    density = std = None
     if args.score == "true":
         height = score_true(model, zs, args)
         label = "fitness (actual SAC return)"
     elif args.score == "knn":
-        knn = make_knn_scorer(model)
-        height = knn(zs.astype(np.float64)).reshape(args.grid, args.grid)
+        reference = encoded_reference(model)             # encode logged trees once
+        zs64 = zs.astype(np.float64)
+        knn = make_knn_scorer(model, reference=reference)
+        height = knn(zs64).reshape(args.grid, args.grid)
+        density = make_knn_density(model, reference=reference)(zs64).reshape(args.grid, args.grid)
+        std = make_knn_std(model, reference=reference)(zs64).reshape(args.grid, args.grid)
         label = "fitness (kNN of logged returns)"
         # still decode for a validity readout
         n_unique = _decode_readout(model, zs)
         print(f"decoded grid: {n_unique} unique trees")
+        print(f"tree density: min={density.min():.2f} max={density.max():.2f} "
+              f"mean={density.mean():.2f}")
+        print(f"kNN std: min={std.min():.2f} max={std.max():.2f} mean={std.mean():.2f}")
     else:
         scorer = make_proxy_scorer()
         heights = np.empty(len(zs), dtype=np.float64)
@@ -305,8 +637,14 @@ def main():
     # Step 6: smooth
     height_s = gaussian_smooth(height, args.smooth)
 
-    out = os.path.join(C.FIG_DIR, f"surface_{args.score}_seed{args.seed}")
-    plot_surface(lin, height_s, label, out)
+    if args.direction == "good-bad":
+        axis_labels = ("good->bad axis (d1)", "orthogonal random (d2)")
+        dtag = "_goodbad"
+    else:
+        axis_labels = ("random direction 1", "random direction 2")
+        dtag = ""
+    out = os.path.join(C.FIG_DIR, f"surface_{args.score}_{args.center}{dtag}_seed{args.seed}")
+    plot_surface(lin, height_s, label, out, density=density, std=std, axis_labels=axis_labels)
 
 
 @torch.no_grad()

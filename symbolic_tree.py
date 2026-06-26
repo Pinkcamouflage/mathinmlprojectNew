@@ -108,6 +108,41 @@ class SymbolicNode:
 
         raise ValueError(f"Unknown node value: {v}")
 
+    def compile_eval(self):
+        """Pre-resolve this tree to a fast callable fn(obs, action, next_obs) -> (B,).
+
+        Resolves terminals to column selectors and operators to function refs ONCE,
+        so per-step evaluation skips the startswith checks, int(v[...]) parsing,
+        dict lookups, and torch.full re-allocation that `evaluate` repeats every
+        call. Pure function of the current structure (nothing cached on the node),
+        so after a genetic operator rewrites the tree you just recompile.
+        Numerically identical to `evaluate`.
+        """
+        v = self.value
+        if v in _OP_FNS:
+            fn = _OP_FNS[v]
+            cs = [c.compile_eval() for c in self.children]
+            if len(cs) == 1:
+                (c0,) = cs
+                return lambda o, a, n: fn(c0(o, a, n))
+            if len(cs) == 2:
+                c0, c1 = cs
+                return lambda o, a, n: fn(c0(o, a, n), c1(o, a, n))
+            if len(cs) == 3:
+                c0, c1, c2 = cs
+                return lambda o, a, n: fn(c0(o, a, n), c1(o, a, n), c2(o, a, n))
+            return lambda o, a, n: fn(*[c(o, a, n) for c in cs])
+        if v == "const":
+            c = float(self.const_val)
+            return lambda o, a, n: o.new_full((o.shape[0],), c)
+        if v.startswith("next_obs_"):
+            i = int(v[9:]); return lambda o, a, n: n[:, i]
+        if v.startswith("obs_"):
+            i = int(v[4:]); return lambda o, a, n: o[:, i]
+        if v.startswith("action_"):
+            i = int(v[7:]); return lambda o, a, n: a[:, i]
+        raise ValueError(f"Unknown node value: {v}")
+
     def clone(self):
         return SymbolicNode(
             self.value,
